@@ -46,14 +46,14 @@ class Ranker(ABC):
     """
     Все модели реализуют этот интерфейс. Runner видит только его.
 
-    Контракт по данным:
+    Данные:
       - train_df/valid_df/test_df — pd.DataFrame, уже с фичами,
         одна строка = (user, item) кандидат, с колонками label/group_id.
       - Группы идут подряд, отсортированы по group_id (требование CatBoost
         и удобно для батчевания в нейронках).
       - feature_spec говорит, что категориально/численно.
 
-    Контракт по predict:
+    Predict:
       - на вход тот же формат DataFrame;
       - на выход 1-D numpy массив длины len(df) со скорами;
       - порядок скоров = порядок строк входа. Это критично для метрик.
@@ -90,14 +90,13 @@ class Ranker(ABC):
         """
         Число обучаемых параметров. Для CatBoost — сумма листьев
         (приближённо), для nn — sum(p.numel() for p in parameters).
-        Нужно только для таблицы результатов, не критично.
         """
         ...
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Реестр моделей: строка из ModelConfig.kind → класс
-# Регистрацию делают сами модули (см. decorator ниже).
+# Регистрацию делают сами модули
 # ─────────────────────────────────────────────────────────────────────────────
 _REGISTRY: dict[str, type[Ranker]] = {}
 
@@ -138,8 +137,7 @@ def build_model(kind: str) -> Ranker:
 @dataclass
 class RunRecord:
     """
-    Всё, что анализ-ноутбук хочет знать про один запуск.
-    Плоская структура специально — чтобы в pandas было удобно pivot'ить.
+    Метаданные об экспериментах
     """
     # ─── идентификация ───────────────────────────────────────────────────────
     run_id: str
@@ -189,7 +187,7 @@ class RunRecord:
         return d
 
     def summary(self) -> str:
-        """Человекочитаемая строчка для print после run_experiment."""
+        """Строчка для print после run_experiment."""
         lines = [
             f"[{self.run_id}]",
             f"  {self.model} on {self.dataset} "
@@ -215,9 +213,8 @@ class RunRecord:
 
 def append_run_record(record: RunRecord, runs_parquet_path: str) -> None:
     """
-    Дописывает строчку в results/runs.parquet.
-    Реализовано как read→concat→write: для нашего объёма (сотни строк)
-    это ок и проще, чем append в parquet (которого нет в pyarrow из коробки).
+    Дописывает строчку в results/runs.parquet
+    Реализовано как read→concat→write
     """
     import os
     row = pd.DataFrame([record.to_dict()])

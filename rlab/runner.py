@@ -27,8 +27,8 @@ from rlab.models.base import (
 # Без этих импортов build_model("catboost") упадёт с KeyError.
 # Добавляя новую модель — добавь строчку сюда.
 import rlab.models.catboost_ranker  # noqa: F401
-# import rlab.models.dcnv2_ranker   # раскомментируется, когда напишем
-# import rlab.models.deepfm_ranker
+import rlab.models.dcnv2_ranker     # noqa: F401
+import rlab.models.deepfm_ranker    # noqa: F401
 
 
 def set_global_seed(seed: int) -> None:

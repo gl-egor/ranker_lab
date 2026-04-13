@@ -1,8 +1,5 @@
 """
 Обёртка CatBoostRanker под интерфейс Ranker.
-
-По сути — код из version2.ipynb, вынесенный в класс. Внутри CatBoost
-уже учится на группах и умеет в YetiRank — ничего не меняем.
 """
 
 from __future__ import annotations
@@ -16,7 +13,7 @@ import pandas as pd
 from rlab.models.base import FeatureSpec, Ranker, register_model
 
 
-# Дефолты — из version2.ipynb. Любой параметр переопределяется через
+#Любой параметр переопределяется через
 # ModelConfig.params в конфиге эксперимента.
 DEFAULT_PARAMS: dict[str, Any] = {
     "loss_function": "YetiRank",
@@ -63,9 +60,6 @@ class CatBoostRankerWrapper(Ranker):
         Обучение. Сливает DEFAULT_PARAMS с пользовательскими params,
         собирает Pool'ы, зовёт .fit, запоминает best_iteration.
         """
-        # импорт внутри метода — чтобы импорт rlab не падал, если
-        # catboost не установлен (например, если кто-то хочет
-        # использовать только DCN-v2).
         from catboost import CatBoostRanker, Pool
 
         self._feature_cols = feature_spec.feature_cols
@@ -77,8 +71,7 @@ class CatBoostRankerWrapper(Ranker):
         effective = {**DEFAULT_PARAMS, **params, "random_seed": seed}
 
         # ── Pool'ы ────────────────────────────────────────────────────
-        # Pool — это структура данных CatBoost, которая хранит
-        # X + y + group_id + cat_features вместе.
+        # хранит X + y + group_id + cat_features вместе.
         train_pool = Pool(
             data=train_df[self._feature_cols],
             label=train_df[feature_spec.target_col].values,
