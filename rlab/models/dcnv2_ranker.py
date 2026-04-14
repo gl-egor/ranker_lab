@@ -42,7 +42,79 @@ from rlab.models._torch_utils import (
     train_neural_ranker,
 )
 from rlab.models.base import FeatureSpec, Ranker, register_model
+from functools import partial
+from rlab.data.features import make_feature_row, TrainAggregates, compute_train_aggregates
+from collections import Counter
 
+def make_feature_row_wrapper(
+    user_idx: int,
+    item_idx: int,
+    label: int,
+    group_id: int,
+    *,
+    user_histories: dict[int, list[int]],
+    user_counters: dict[int, dict[int, int]],
+    agg: TrainAggregates,
+):
+    history_items = user_histories.get(user_idx, [])
+    history_counter = user_counters.get(user_idx, {})
+
+    return make_feature_row(
+        user_idx=user_idx,
+        item_idx=item_idx,
+        history_items=history_items,
+        history_counter=history_counter,
+        agg=agg,
+        label=label,
+        group_id=group_id,
+    )
+
+def _build_make_row_fn(
+    self,
+    train_df: pd.DataFrame,
+    feature_spec: FeatureSpec,
+) -> callable:
+    """
+    Callback (user_idx, item_idx, label, group_id) -> dict для hard mining.
+
+    Использует train_aggregates из feature_spec (посчитаны в loader.py
+    по raw interactions с rating — здесь их реконструировать невозможно,
+    т.к. rank_table содержит только label).
+
+    Истории юзеров восстанавливаем из позитивов rank_table — для этого
+    rating не нужен.
+    """
+    if feature_spec.train_aggregates is None:
+        raise RuntimeError(
+            "hard_mining=True требует feature_spec.train_aggregates. "
+            "Убедитесь, что loader.py заполняет это поле при построении "
+            "FeatureSpec (см. compute_train_aggregates в features.py)."
+        )
+
+    pos_df = train_df[train_df[feature_spec.target_col] == 1]
+
+    # История юзера = items, которые он реально взаимодействовал в train.
+    # groupby.agg(list) — каноничная идиома "собери значения в списки по группе".
+    user_histories: dict[int, list[int]] = (
+        pos_df.groupby("user_idx")["item_idx"].agg(list).to_dict()
+    )
+
+    # Counter считает частоты за один проход на C-уровне — быстрее,
+    # чем ручное d[k] = d.get(k, 0) + 1 в цикле Python.
+    user_counters: dict[int, dict[int, int]] = {
+        int(u): dict(Counter(items)) for u, items in user_histories.items()
+    }
+
+    # Приводим ключи к int для консистентности (groupby может вернуть numpy.int64,
+    # а make_feature_row внутри, возможно, делает history_counter.get(item_idx))
+    user_histories = {int(k): [int(x) for x in v] for k, v in user_histories.items()}
+
+    return partial(
+        make_feature_row_wrapper,
+        user_histories=user_histories,
+        user_counters=user_counters,
+        agg=feature_spec.train_aggregates,
+    )
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Архитектура
@@ -177,12 +249,21 @@ class DCNv2Ranker(Ranker):
             layer_norm=p["layer_norm"],
         ).to(self._device)
 
+        make_row_fn = None
+        if p.get("hard_mining", False):
+            make_row_fn = self._build_make_row_fn(train_df, feature_spec)
+
         # Тренировка через общий loop
         return train_neural_ranker(
             model=self._model,
-            train_df=train_df, valid_df=valid_df,
-            feature_spec=feature_spec, scaler=self._scaler,
-            params=p, seed=seed, device=self._device,
+            train_df=train_df,
+            valid_df=valid_df,
+            feature_spec=feature_spec,
+            scaler=self._scaler,
+            params=p,
+            seed=seed,
+            device=self._device,
+            make_row_fn=make_row_fn,   # None при выключенном hard mining
         )
 
     def predict(self, df: pd.DataFrame, feature_spec: FeatureSpec) -> np.ndarray:

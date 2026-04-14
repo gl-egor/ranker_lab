@@ -18,6 +18,7 @@ import pandas as pd
 
 if TYPE_CHECKING:
     from rlab.configs import ExperimentConfig
+    from rlab.data.features import TrainAggregates
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -32,6 +33,7 @@ class FeatureSpec:
     categorical_cols: list[str] = field(default_factory=list)
     numerical_cols: list[str] = field(default_factory=list)
     cardinalities: dict[str, int] = field(default_factory=dict)  # для nn.Embedding
+    train_aggregates: "TrainAggregates | None" = None
 
     @property
     def feature_cols(self) -> list[str]:

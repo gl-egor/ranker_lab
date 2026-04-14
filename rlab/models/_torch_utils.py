@@ -7,11 +7,12 @@
     - group_softmax_loss    — listwise log-softmax по группе
     - build_param_groups    — раздельные lr для эмбеддингов и плотных слоёв
     - build_scheduler       — фабрика lr-шедулеров (cosine / plateau / none)
-    - train_neural_ranker   — общий training loop с early stopping
+    - train_neural_ranker   — общий training loop с early stopping и hard mining
 
-Принцип: всё, что относится к стандартной тренировке (loop / optimizer /
-scheduler / валидация / early stop), живёт здесь. В обёртках конкретных
-моделей (dcnv2_ranker, deepfm_ranker) остаётся только архитектура.
+Hard mining (v2):
+    После warmup_epochs эпох пересэмплируем негативы в train_df на основе
+    текущих скоров модели. Valid/Test остаются фиксированными — для честного
+    сравнения с CatBoost.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from rlab.models.base import FeatureSpec
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Dataset / Sampler / Loss (как было)
+# Dataset / Sampler / Loss
 # ═════════════════════════════════════════════════════════════════════════════
 class RankTableDataset(Dataset):
     """
@@ -111,6 +112,169 @@ def group_softmax_loss(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Hard Negative Mining (v2: per-user, с пересборкой фичей)
+# ═════════════════════════════════════════════════════════════════════════════
+def _mine_hard_negatives_batched(
+    model: nn.Module,
+    forward_fn: Callable,
+    device: str,
+    user_indices: np.ndarray,   # (n_groups,)
+    pos_items: np.ndarray,      # (n_groups,)
+    item_pool: np.ndarray,
+    n_hard: int,
+    n_candidates: int,
+    num_feat_dim: int,
+    rng: np.random.Generator,
+    scoring_batch: int = 65536,
+) -> np.ndarray:
+    """
+    Per-user hard mining батчевым скорингом.
+
+    Идея: для каждой группы (юзера) сэмплим n_candidates случайных items,
+    скорим их моделью разом, берём top-n_hard.
+
+    num_feat передаём как нули: нам нужен относительный порядок items
+    для фиксированного юзера, а не абсолютный скор. Это дешёвый прокси,
+    стандартный в литературе по hard mining. Вы не учите на этих скорах,
+    только ранжируете кандидатов.
+
+    Возвращает: (n_groups, n_hard) с item_idx.
+    """
+    n_groups = len(user_indices)
+
+    # Случайные кандидаты — один np.choice вместо цикла
+    candidates = rng.choice(
+        item_pool, size=(n_groups, n_candidates), replace=True,
+    )  # (n_groups, n_candidates)
+
+    users_flat = np.repeat(user_indices, n_candidates)
+    items_flat = candidates.reshape(-1)
+
+    model.eval()
+    scores = np.empty(len(users_flat), dtype=np.float32)
+    with torch.no_grad():
+        for s in range(0, len(users_flat), scoring_batch):
+            e = s + scoring_batch
+            u = torch.from_numpy(users_flat[s:e]).long().to(device)
+            i = torch.from_numpy(items_flat[s:e]).long().to(device)
+            n = torch.zeros(e - s if e <= len(users_flat) else len(users_flat) - s,
+                            num_feat_dim, device=device)
+            scores[s:e] = forward_fn(model, u, i, n[:len(u)]).cpu().numpy()
+
+    scores = scores.reshape(n_groups, n_candidates)
+
+    # Маскируем позитив на случай, если он случайно попал в кандидаты
+    pos_mask = candidates == pos_items[:, None]
+    scores = np.where(pos_mask, -np.inf, scores)
+
+    # argpartition — O(n) top-k вместо O(n log n) у argsort.
+    # Для каждой строки берём индексы n_hard наибольших скоров.
+    top_idx = np.argpartition(-scores, n_hard, axis=1)[:, :n_hard]
+    return np.take_along_axis(candidates, top_idx, axis=1)
+
+
+def resample_negatives_hard(
+    *,
+    train_df: pd.DataFrame,
+    model: nn.Module,
+    forward_fn: Callable,
+    feature_spec: FeatureSpec,
+    make_row_fn: Callable[[int, int, int, int], dict],
+    n_neg: int,
+    hard_ratio: float,
+    device: str,
+    seed: int,
+    n_candidates: int = 200,
+) -> pd.DataFrame:
+    """
+    Пересэмплинг негативов с per-user hard mining и пересчётом item-фичей.
+
+    Параметры:
+        train_df    : текущая rank_table (нужны только позитивы для каркаса).
+        make_row_fn : (user_idx, item_idx, label, group_id) -> dict.
+                      Обязательно должен корректно считать все item-фичи
+                      (popularity, mean_rating) из train-агрегатов.
+                      Предоставляется вызывающей стороной (dcnv2_ranker/deepfm_ranker),
+                      обычно через functools.partial поверх features.make_feature_row.
+        hard_ratio  : доля hard среди n_neg. Остальное — random для diversity.
+        n_candidates: размер пула для hard mining на каждого юзера.
+    """
+    rng = np.random.default_rng(seed)
+
+    # Каркас из позитивов — одна строка на группу
+    pos_df = (
+        train_df[train_df[feature_spec.target_col] == 1]
+        [["user_idx", "item_idx", feature_spec.group_col]]
+        .sort_values(feature_spec.group_col)
+        .reset_index(drop=True)
+    )
+    user_idx_arr = pos_df["user_idx"].to_numpy()
+    pos_item_arr = pos_df["item_idx"].to_numpy()
+    group_id_arr = pos_df[feature_spec.group_col].to_numpy()
+
+    item_pool = np.sort(train_df["item_idx"].unique())
+    num_feat_dim = len(feature_spec.numerical_cols)
+
+    n_hard = int(round(n_neg * hard_ratio))
+    n_random = n_neg - n_hard
+
+    # ── 1. Hard негативы per-user, батчевым скорингом ───────────────────
+    if n_hard > 0:
+        hard_negs = _mine_hard_negatives_batched(
+            model=model, forward_fn=forward_fn, device=device,
+            user_indices=user_idx_arr, pos_items=pos_item_arr,
+            item_pool=item_pool,
+            n_hard=n_hard, n_candidates=n_candidates,
+            num_feat_dim=num_feat_dim, rng=rng,
+        )  # (n_groups, n_hard)
+    else:
+        hard_negs = np.empty((len(pos_df), 0), dtype=np.int64)
+
+    # ── 2. Random негативы батчем с фильтрацией forbidden ───────────────
+    # Для каждой группы forbidden = {pos} ∪ hard_negs[group].
+    # Берём пул с запасом и отбрасываем коллизии.
+    random_negs = np.empty((len(pos_df), n_random), dtype=np.int64)
+    if n_random > 0:
+        over_sample = max(n_random * 4, 16)
+        raw = rng.choice(item_pool, size=(len(pos_df), over_sample), replace=True)
+        for g in range(len(pos_df)):
+            forbidden = {int(pos_item_arr[g])}
+            forbidden.update(int(x) for x in hard_negs[g])
+            chosen: list[int] = []
+            for c in raw[g]:
+                c_int = int(c)
+                if c_int in forbidden:
+                    continue
+                forbidden.add(c_int)  # и от дублей внутри группы
+                chosen.append(c_int)
+                if len(chosen) == n_random:
+                    break
+            # страховка для микро-пулов
+            while len(chosen) < n_random:
+                c_int = int(rng.choice(item_pool))
+                if c_int not in forbidden:
+                    forbidden.add(c_int)
+                    chosen.append(c_int)
+            random_negs[g] = chosen
+
+    # ── 3. Пересборка rank_table через make_row_fn ──────────────────────
+    # Именно здесь пересчитываются item-зависимые фичи (popularity и т.д.).
+    rows: list[dict] = []
+    for g in range(len(pos_df)):
+        u = int(user_idx_arr[g])
+        gid = int(group_id_arr[g])
+        rows.append(make_row_fn(u, int(pos_item_arr[g]), 1, gid))
+        for it in hard_negs[g]:
+            rows.append(make_row_fn(u, int(it), 0, gid))
+        for it in random_negs[g]:
+            rows.append(make_row_fn(u, int(it), 0, gid))
+
+    out = pd.DataFrame(rows)
+    # Сохраняем инвариант loader.py: группы идут подряд
+    out = out.sort_values([feature_spec.group_col, feature_spec.target_col],
+                          ascending=[True, False]).reset_index(drop=True)
+    return out
+# ═════════════════════════════════════════════════════════════════════════════
 # Optimizer / Scheduler factories
 # ═════════════════════════════════════════════════════════════════════════════
 def build_param_groups(
@@ -136,13 +300,6 @@ def build_param_groups(
                            (например, 1e-2), чтобы давить редкие
                            id-эмбеддинги к нулю.
         weight_decay     : wd для dense-группы.
-
-    Зачем разделять:
-        - Embedding-таблицы у нас огромные (миллионы строк), но
-          в каждом батче активны только сотни. Большой lr на них
-          приводит к шумным обновлениям тех немногих строк, что
-          попали в батч; маленький — стабилизирует.
-        - Dense-слои наоборот хорошо переваривают стандартный AdamW lr.
     """
     emb_params, dense_params = [], []
     for name, param in model.named_parameters():
@@ -178,19 +335,9 @@ def build_scheduler(
 
     kind:
         'none'    → None, lr константный.
-        'cosine'  → CosineAnnealingLR, плавный спуск с lr_max до eta_min
-                    за n_epochs * n_steps_per_epoch шагов. Шаги делаются
-                    каждый батч (см. n_steps_per_epoch).
-        'plateau' → ReduceLROnPlateau по val NDCG, factor=0.5, patience=1.
-                    Шагается раз в эпоху, требует передачи метрики.
-                    Удобен, когда заранее непонятно, сколько эпох будет
-                    (early stop может выключить раньше cosine).
-        'warmup_cosine' → линейный warmup на warmup_epochs эпох до lr_max,
-                          затем cosine до eta_min до конца.
-
-    kwargs:
-        eta_min        : минимальный lr (для cosine), default 1e-6.
-        warmup_epochs  : сколько эпох разогрева для warmup_cosine.
+        'cosine'  → CosineAnnealingLR до eta_min.
+        'plateau' → ReduceLROnPlateau по val NDCG.
+        'warmup_cosine' → линейный warmup + cosine decay.
     """
     if kind == "none":
         return None
@@ -219,18 +366,16 @@ def build_scheduler(
         def lr_lambda(step: int) -> float:
             if step < warmup_steps:
                 return float(step) / max(1, warmup_steps)
-            # cosine от 1.0 до eta_min/lr_base за оставшиеся шаги
             progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
             return 0.5 * (1.0 + np.cos(np.pi * progress))
 
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    raise ValueError(f"Unknown scheduler kind '{kind}'. "
-                     f"Use one of: none, cosine, plateau, warmup_cosine.")
+    raise ValueError(f"Unknown scheduler kind '{kind}'.")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Универсальный training loop
+# Универсальный training loop с hard mining
 # ═════════════════════════════════════════════════════════════════════════════
 def train_neural_ranker(
     *,
@@ -243,53 +388,68 @@ def train_neural_ranker(
     seed: int,
     device: str,
     forward_fn: Callable[[nn.Module, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
+    make_row_fn: Callable | None = None, #for hard mining
 ) -> dict[str, Any]:
     """
     Универсальный training loop для нейронных ранкеров.
 
-    Контракт модели:
-        forward_fn(model, user_idx, item_idx, num_feat) -> scores (B,)
-        Если None — используется model(user_idx, item_idx, num_feat).
-        Через forward_fn можно адаптировать модель с другой сигнатурой.
-
-    Все гиперпараметры берутся из params (с дефолтами):
-        lr, weight_decay, emb_lr_mult, emb_weight_decay
-        max_epochs, patience, groups_per_batch, grad_clip
-        scheduler ('none' | 'cosine' | 'plateau' | 'warmup_cosine')
-        scheduler_kwargs (dict, передаётся в build_scheduler)
+    Hard mining (новое):
+        params["hard_mining"]         : bool, включить ли (default: False)
+        params["hard_mining_warmup"]  : int, эпох warmup (default: 2)
+        params["hard_ratio"]          : float, доля hard негативов (default: 0.5)
+    
+    После warmup эпох:
+        1. Вычисляем скоры модели для всех items
+        2. Пересэмплируем негативы в train_df (hard + random mix)
+        3. Пересоздаём DataLoader
+    
+    Valid остаётся фиксированным — для честного сравнения с CatBoost.
 
     Возвращает:
-        train_history     : list[dict]
-        train_time_sec    : float
-        best_val_ndcg     : float
-        best_state_dict   : dict с весами лучшей эпохи (уже загружен в model)
+        train_history, train_time_sec, best_val_ndcg, best_state_dict
     """
     torch.manual_seed(seed)
 
-    # ── DataLoaders ─────────────────────────────────────────────────────
-    train_ds = RankTableDataset(train_df, feature_spec, scaler)
-    valid_ds = RankTableDataset(valid_df, feature_spec, scaler)
+    # Hard mining params
+    use_hard_mining = params.get("hard_mining", False)
+    hard_mining_warmup = params.get("hard_mining_warmup", 2)
+    hard_ratio = params.get("hard_ratio", 0.5)
+    n_candidates = params.get("hard_mining_n_candidates", 200)
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_sampler=GroupBatchSampler(
-            train_df[feature_spec.group_col].values,
-            groups_per_batch=params["groups_per_batch"],
-            shuffle=True, seed=seed,
-        ),
-        num_workers=0, pin_memory=(device == "cuda"),
-    )
-    valid_loader = DataLoader(
-        valid_ds,
-        batch_sampler=GroupBatchSampler(
-            valid_df[feature_spec.group_col].values,
-            groups_per_batch=params["groups_per_batch"],
-            shuffle=False, seed=seed,
-        ),
-        num_workers=0,
-    )
+    if use_hard_mining and make_row_fn is None:
+        raise ValueError(
+            "hard_mining=True требует make_row_fn для корректного "
+            "пересчёта item-фичей. Передайте callback из features.py."
+        )
+    
+    # Определяем n_neg из train_df
+    group_sizes = train_df.groupby("group_id").size()
+    n_neg = int(group_sizes.iloc[0]) - 1  # размер группы - 1 позитив
+    
+    # n_items для compute_item_scores
+    n_items = feature_spec.cardinalities.get("item_idx", train_df["item_idx"].max() + 1)
 
-    # ── Optimizer с param groups ────────────────────────────────────────
+    # ── Создаём DataLoaders ─────────────────────────────────────────────
+    def _make_loader(df: pd.DataFrame, shuffle: bool, loader_seed: int) -> DataLoader:
+        ds = RankTableDataset(df, feature_spec, scaler)
+        return DataLoader(
+            ds,
+            batch_sampler=GroupBatchSampler(
+                df[feature_spec.group_col].values,
+                groups_per_batch=params["groups_per_batch"],
+                shuffle=shuffle, seed=loader_seed,
+            ),
+            num_workers=0, pin_memory=(device == "cuda"),
+        )
+
+    # Train loader будет пересоздаваться при hard mining
+    current_train_df = train_df.copy()
+    train_loader = _make_loader(current_train_df, shuffle=True, loader_seed=seed)
+    
+    # Valid loader фиксирован
+    valid_loader = _make_loader(valid_df, shuffle=False, loader_seed=seed)
+
+    # ── Optimizer ───────────────────────────────────────────────────────
     param_groups = build_param_groups(
         model,
         lr=params["lr"],
@@ -308,17 +468,14 @@ def train_neural_ranker(
         n_steps_per_epoch=len(train_loader),
         **sched_kwargs,
     )
-    # Шагать ли scheduler каждый батч (cosine/warmup_cosine — да)
-    # или раз в эпоху (plateau)?
     step_each_batch = sched_kind in ("cosine", "warmup_cosine")
 
-    # ── Early stopping bookkeeping ──────────────────────────────────────
+    # ── Early stopping ──────────────────────────────────────────────────
     best_ndcg = -1.0
     best_state: dict | None = None
     patience = 0
     history: list[dict] = []
 
-    # импорт здесь — чтобы избежать циклической зависимости
     from rlab.eval.metrics import ranking_metrics
 
     if forward_fn is None:
@@ -326,7 +483,26 @@ def train_neural_ranker(
 
     t0 = time.time()
     for epoch in trange(1, params["max_epochs"] + 1, desc="epoch", unit="ep"):
-        # ── train ───────────────────────────────────────────────────────
+        
+        # ── Hard mining: пересэмплируем негативы после warmup ───────────
+        if use_hard_mining and epoch > hard_mining_warmup:
+            print(f"  [hard mining] epoch {epoch}: пересэмплинг негативов...")
+            current_train_df = resample_negatives_hard(
+                train_df=train_df,             # исходный (с warm-start позитивами)
+                model=model,
+                forward_fn=forward_fn,
+                feature_spec=feature_spec,
+                make_row_fn=make_row_fn,
+                n_neg=n_neg,
+                hard_ratio=hard_ratio,
+                device=device,
+                seed=seed + epoch,
+                n_candidates=n_candidates,
+            )
+            train_loader = _make_loader(current_train_df, shuffle=True,
+                                        loader_seed=seed + epoch)
+
+        # ── Train ───────────────────────────────────────────────────────
         model.train()
         losses = []
         for u, i, n, y, g in tqdm(train_loader, desc=f"  train e{epoch}",
@@ -345,13 +521,12 @@ def train_neural_ranker(
                 scheduler.step()
             losses.append(loss.item())
 
-        # ── eval ────────────────────────────────────────────────────────
+        # ── Eval ────────────────────────────────────────────────────────
         val_scores, val_labels, val_groups = _predict_loader(
             model, valid_loader, device, forward_fn
         )
         metrics = ranking_metrics(val_scores, val_labels, val_groups, k=10)
 
-        # текущий lr (после возможного step) — для логов
         cur_lrs = [g["lr"] for g in opt.param_groups]
         history.append({
             "epoch": epoch,
@@ -360,16 +535,18 @@ def train_neural_ranker(
             "val_HR@10":   metrics["HR"],
             "lr_emb":   cur_lrs[0],
             "lr_dense": cur_lrs[1] if len(cur_lrs) > 1 else cur_lrs[0],
+            "hard_mining_active": use_hard_mining and epoch > hard_mining_warmup,
         })
-        print(f"  [e{epoch}] loss={np.mean(losses):.4f} "
+        
+        hm_status = " [HM]" if (use_hard_mining and epoch > hard_mining_warmup) else ""
+        print(f"  [e{epoch}]{hm_status} loss={np.mean(losses):.4f} "
               f"val NDCG@10={metrics['NDCG']:.4f} "
               f"lr_emb={cur_lrs[0]:.2e}")
 
-        # plateau шагает раз в эпоху по метрике
         if scheduler is not None and not step_each_batch:
             scheduler.step(metrics["NDCG"])
 
-        # early stopping по val NDCG
+        # Early stopping
         if metrics["NDCG"] > best_ndcg:
             best_ndcg = metrics["NDCG"]
             best_state = {k: v.detach().cpu().clone()
@@ -382,7 +559,6 @@ def train_neural_ranker(
                       f"(best NDCG@10={best_ndcg:.4f})")
                 break
 
-    # восстанавливаем лучшие веса
     if best_state is not None:
         model.load_state_dict(best_state)
 
@@ -411,7 +587,7 @@ def _predict_loader(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Helper: предсказание на произвольном DataFrame (для Ranker.predict)
+# Helper: предсказание на произвольном DataFrame
 # ═════════════════════════════════════════════════════════════════════════════
 def predict_dataframe(
     model: nn.Module,
@@ -422,7 +598,7 @@ def predict_dataframe(
     forward_fn: Callable | None = None,
     batch_size: int = 8192,
 ) -> np.ndarray:
-    """Предсказания на тесте/любом DataFrame, без листового батчевания."""
+    """Предсказания на тесте/любом DataFrame."""
     if forward_fn is None:
         forward_fn = lambda m, u, i, n: m(u, i, n)
 

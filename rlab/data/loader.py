@@ -28,6 +28,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pickle
 
 import numpy as np
 import pandas as pd
@@ -293,6 +294,7 @@ def _cache_paths(cache_dir: str, key: str) -> dict[str, str]:
         "valid": str(base / "valid.parquet"),
         "test":  str(base / "test.parquet"),
         "meta":  str(base / "meta.json"),
+        "agg":   str(base / "agg.pkl"), #Для hard mining
     }
 
 
@@ -318,21 +320,28 @@ def load_dataset(
     paths = _cache_paths(cache_dir, key)
 
     # ── Кеш-hit ──────────────────────────────────────────────────────────
-    if all(os.path.exists(paths[k]) for k in ("train", "valid", "test", "meta")):
+    cache_files = ("train", "valid", "test", "meta", "agg")
+    cache_hit = all(os.path.exists(paths[k]) for k in cache_files)
+
+    if cache_hit:
         print(f"[loader] cache HIT: {key}")
         train = pd.read_parquet(paths["train"])
         valid = pd.read_parquet(paths["valid"])
         test  = pd.read_parquet(paths["test"])
         with open(paths["meta"]) as f:
             meta = json.load(f)
+        with open(paths["agg"], "rb") as f:
+            agg: TrainAggregates = pickle.load(f)
     else:
         print(f"[loader] cache MISS: {key} — building from scratch")
-        train, valid, test, meta = _build_from_scratch(data_cfg, seed, raw_dir)
+        train, valid, test, meta, agg = _build_from_scratch(data_cfg, seed, raw_dir)
         train.to_parquet(paths["train"], index=False)
         valid.to_parquet(paths["valid"], index=False)
         test.to_parquet(paths["test"],  index=False)
         with open(paths["meta"], "w") as f:
             json.dump(meta, f)
+        with open(paths["agg"], "wb") as f:
+            pickle.dump(agg, f)
 
     # ── Apply feature_set (пост-фильтр колонок) ──────────────────────────
     feature_cols = resolve_feature_set(data_cfg.feature_set)
@@ -350,6 +359,7 @@ def load_dataset(
             "user_idx": int(meta["n_users"]) + 1,   # +1 под 0=padding
             "item_idx": int(meta["n_items"]) + 1,
         },
+        train_aggregates=agg, 
     )
     return train, valid, test, spec
 
@@ -431,4 +441,4 @@ def _build_from_scratch(
         "n_test_queries":  len(test_q),
         "neg_strategy":    data_cfg.neg_strategy,
     }
-    return train_rt, valid_rt, test_rt, meta
+    return train_rt, valid_rt, test_rt, meta, agg
