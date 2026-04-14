@@ -1,10 +1,34 @@
 """
 DCN-v2 под интерфейс Ranker.
+
+Архитектура — Cross Network + Deep Network (parallel).
+Тренировка — общий train_neural_ranker из _torch_utils.
+
+Все гиперпараметры выставляются через ModelConfig.params:
+    Архитектура:
+        emb_dim          : размерность эмбеддингов (default 32)
+        n_cross          : число слоёв Cross Network (default 2)
+        mlp_dims         : tuple размерностей скрытых слоёв (default (256, 128))
+        dropout          : dropout в MLP и после конкатенации (default 0.1)
+        layer_norm       : использовать ли LayerNorm на входе (default True)
+    Оптимизация:
+        lr               : базовый lr (default 1e-3)
+        emb_lr_mult      : множитель lr для эмбеддингов (default 1.0)
+        emb_weight_decay : wd для эмбеддингов; None = как у dense (default None)
+        weight_decay     : wd для dense-параметров (default 1e-5)
+        grad_clip        : max_norm для clip_grad_norm (default 1.0)
+    Обучение:
+        max_epochs       : default 15
+        patience         : early stopping (default 3)
+        groups_per_batch : сколько query-групп в батч (default 128)
+    Scheduler:
+        scheduler        : 'none' | 'cosine' | 'plateau' | 'warmup_cosine'
+                           (default 'none')
+        scheduler_kwargs : dict для шедулера (eta_min, warmup_epochs, ...)
 """
 
 from __future__ import annotations
 
-import time
 from typing import Any
 
 import numpy as np
@@ -12,22 +36,19 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
-from torch.utils.data import DataLoader
-from tqdm.auto import tqdm, trange
 
 from rlab.models._torch_utils import (
-    GroupBatchSampler,
-    RankTableDataset,
-    group_softmax_loss,
+    predict_dataframe,
+    train_neural_ranker,
 )
 from rlab.models.base import FeatureSpec, Ranker, register_model
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 1. Архитектура
+# Архитектура
 # ═════════════════════════════════════════════════════════════════════════════
 class CrossLayer(nn.Module):
-    """x_{l+1} = x0 * (W x_l + b) + x_l. Один слой из DCN-V2."""
+    """x_{l+1} = x0 * (W x_l + b) + x_l. Один слой DCN-V2."""
     def __init__(self, input_dim: int):
         super().__init__()
         self.linear = nn.Linear(input_dim, input_dim, bias=True)
@@ -39,14 +60,7 @@ class CrossLayer(nn.Module):
 class DCNv2(nn.Module):
     """
     Parallel DCN-V2: Cross и Deep сети идут параллельно от общего x0,
-    потом их выходы конкатенируются и идут в скалярный скор.
-
-    Принимает:
-        user_idx: (B,) long
-        item_idx: (B,) long
-        num_feat: (B, n_num) float — уже отскейленные
-    Возвращает:
-        scores:   (B,) float
+    их выходы конкатенируются и идут в скалярный скор.
     """
     def __init__(
         self,
@@ -57,13 +71,14 @@ class DCNv2(nn.Module):
         n_cross: int = 2,
         mlp_dims: tuple[int, ...] = (256, 128),
         dropout: float = 0.1,
+        layer_norm: bool = True,
     ):
         super().__init__()
         self.user_emb = nn.Embedding(n_users, emb_dim, padding_idx=0)
         self.item_emb = nn.Embedding(n_items, emb_dim, padding_idx=0)
 
         x0_dim = 2 * emb_dim + n_num_features
-        self.ln = nn.LayerNorm(x0_dim)
+        self.ln = nn.LayerNorm(x0_dim) if layer_norm else nn.Identity()
         self.drop = nn.Dropout(dropout)
 
         self.cross_layers = nn.ModuleList(
@@ -75,9 +90,10 @@ class DCNv2(nn.Module):
         for h in mlp_dims:
             mlp += [nn.Linear(prev, h), nn.ReLU(), nn.Dropout(dropout)]
             prev = h
-        self.mlp = nn.Sequential(*mlp)
+        self.mlp = nn.Sequential(*mlp) if mlp else nn.Identity()
 
-        self.head = nn.Linear(x0_dim + prev, 1)
+        head_in = x0_dim + (prev if mlp_dims else x0_dim)
+        self.head = nn.Linear(head_in, 1)
 
     def forward(
         self,
@@ -100,19 +116,28 @@ class DCNv2(nn.Module):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 2. Обёртка Ranker
+# Обёртка Ranker
 # ═════════════════════════════════════════════════════════════════════════════
 DEFAULT_PARAMS: dict[str, Any] = {
-    "emb_dim":        32,
-    "n_cross":        2,
-    "mlp_dims":       (256, 128),
-    "dropout":        0.1,
-    "lr":             1e-3,
-    "weight_decay":   1e-5,
-    "max_epochs":     15,
-    "patience":       3,
-    "groups_per_batch": 128,
-    "grad_clip":      1.0,
+    # архитектура
+    "emb_dim":           32,
+    "n_cross":           2,
+    "mlp_dims":          (256, 128),
+    "dropout":           0.1,
+    "layer_norm":        True,
+    # оптимизация
+    "lr":                1e-3,
+    "emb_lr_mult":       1.0,
+    "emb_weight_decay":  None,
+    "weight_decay":      1e-5,
+    "grad_clip":         1.0,
+    # обучение
+    "max_epochs":        15,
+    "patience":          3,
+    "groups_per_batch":  128,
+    # scheduler
+    "scheduler":         "none",
+    "scheduler_kwargs":  {},
 }
 
 
@@ -121,10 +146,8 @@ class DCNv2Ranker(Ranker):
     def __init__(self):
         self._model: DCNv2 | None = None
         self._scaler: StandardScaler | None = None
-        self._feature_spec: FeatureSpec | None = None
         self._device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # ─────────────────────────────────────────────────────────────────────
     def fit(
         self,
         train_df: pd.DataFrame,
@@ -134,155 +157,42 @@ class DCNv2Ranker(Ranker):
         seed: int,
     ) -> dict[str, Any]:
         p = {**DEFAULT_PARAMS, **params}
-        torch.manual_seed(seed)
 
-        # ── Scaler по train ──────────────────────────────────────────────
+        # Scaler
         num_cols = feature_spec.numerical_cols
         if num_cols:
             self._scaler = StandardScaler().fit(train_df[num_cols].values)
         else:
-            # dummy: даёт identity transform
             self._scaler = StandardScaler().fit(np.zeros((1, 0)))
-        self._feature_spec = feature_spec
 
-        # ── Модель ───────────────────────────────────────────────────────
-        # cardinalities в feature_spec — это "max_idx + 1", т.е. размер
-        # таблицы эмбеддингов.
-        n_users = feature_spec.cardinalities.get("user_idx", 0)
-        n_items = feature_spec.cardinalities.get("item_idx", 0)
+        # Модель
         self._model = DCNv2(
-            n_users=n_users, n_items=n_items,
+            n_users=feature_spec.cardinalities.get("user_idx", 0),
+            n_items=feature_spec.cardinalities.get("item_idx", 0),
             emb_dim=p["emb_dim"],
             n_num_features=len(num_cols),
             n_cross=p["n_cross"],
             mlp_dims=tuple(p["mlp_dims"]),
             dropout=p["dropout"],
+            layer_norm=p["layer_norm"],
         ).to(self._device)
 
-        # ── Data loaders ─────────────────────────────────────────────────
-        train_ds = RankTableDataset(train_df, feature_spec, self._scaler)
-        valid_ds = RankTableDataset(valid_df, feature_spec, self._scaler)
-
-        train_loader = DataLoader(
-            train_ds,
-            batch_sampler=GroupBatchSampler(
-                train_df[feature_spec.group_col].values,
-                groups_per_batch=p["groups_per_batch"],
-                shuffle=True, seed=seed,
-            ),
-            num_workers=0, pin_memory=(self._device == "cuda"),
-        )
-        valid_loader = DataLoader(
-            valid_ds,
-            batch_sampler=GroupBatchSampler(
-                valid_df[feature_spec.group_col].values,
-                groups_per_batch=p["groups_per_batch"],
-                shuffle=False, seed=seed,
-            ),
-            num_workers=0,
+        # Тренировка через общий loop
+        return train_neural_ranker(
+            model=self._model,
+            train_df=train_df, valid_df=valid_df,
+            feature_spec=feature_spec, scaler=self._scaler,
+            params=p, seed=seed, device=self._device,
         )
 
-        # ── Optimizer ────────────────────────────────────────────────────
-        opt = torch.optim.AdamW(
-            self._model.parameters(),
-            lr=p["lr"], weight_decay=p["weight_decay"],
-        )
-
-        # ── Training loop с early stopping ───────────────────────────────
-        # Метрика для early stopping — NDCG@k на valid.
-        # Импорт здесь, чтобы не создавать цикла.
-        from rlab.eval.metrics import ranking_metrics
-
-        best_ndcg = -1.0
-        best_state = None
-        patience = 0
-        history = []
-
-        t0 = time.time()
-        for epoch in trange(1, p["max_epochs"] + 1, desc="epoch", unit="ep"):
-            # train
-            self._model.train()
-            losses = []
-            for u, i, n, y, g in tqdm(train_loader, desc=f"  train e{epoch}",
-                                       leave=False, unit="batch"):
-                u, i, n = u.to(self._device), i.to(self._device), n.to(self._device)
-                y, g    = y.to(self._device), g.to(self._device)
-
-                scores = self._model(u, i, n)
-                loss = group_softmax_loss(scores, y, g)
-
-                opt.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(self._model.parameters(), p["grad_clip"])
-                opt.step()
-                losses.append(loss.item())
-
-            # eval
-            val_scores, val_labels, val_groups = self._predict_loader(valid_loader)
-            metrics = ranking_metrics(val_scores, val_labels, val_groups, k=10)
-            history.append({
-                "epoch": epoch,
-                "train_loss": float(np.mean(losses)),
-                "val_NDCG@10": metrics["NDCG"],
-                "val_HR@10":   metrics["HR"],
-            })
-            print(f"  [e{epoch}] loss={np.mean(losses):.4f} "
-                  f"val NDCG@10={metrics['NDCG']:.4f}")
-
-            # early stopping
-            if metrics["NDCG"] > best_ndcg:
-                best_ndcg = metrics["NDCG"]
-                best_state = {k: v.detach().cpu().clone()
-                              for k, v in self._model.state_dict().items()}
-                patience = 0
-            else:
-                patience += 1
-                if patience >= p["patience"]:
-                    print(f"  early stop at epoch {epoch} "
-                          f"(best NDCG@10={best_ndcg:.4f})")
-                    break
-
-        # восстанавливаем лучшие веса
-        if best_state is not None:
-            self._model.load_state_dict(best_state)
-
-        return {
-            "train_time_sec": time.time() - t0,
-            "best_val_ndcg":  best_ndcg,
-            "train_history":  history,
-        }
-
-    # ─────────────────────────────────────────────────────────────────────
     def predict(self, df: pd.DataFrame, feature_spec: FeatureSpec) -> np.ndarray:
         if self._model is None:
             raise RuntimeError("Model not fitted")
-        ds = RankTableDataset(df, feature_spec, self._scaler)
-        # большой батч — просто по позициям, group-структура на predict не важна
-        loader = DataLoader(ds, batch_size=8192, shuffle=False, num_workers=0)
+        return predict_dataframe(
+            self._model, df, feature_spec, self._scaler, self._device
+        )
 
-        self._model.eval()
-        scores = []
-        with torch.no_grad():
-            for u, i, n, _, _ in loader:
-                u = u.to(self._device); i = i.to(self._device); n = n.to(self._device)
-                scores.append(self._model(u, i, n).cpu().numpy())
-        return np.concatenate(scores).astype(np.float32)
-
-    # ─────────────────────────────────────────────────────────────────────
     def n_params(self) -> int:
         if self._model is None:
             return 0
         return sum(p.numel() for p in self._model.parameters())
-
-    # ─────────────────────────────────────────────────────────────────────
-    def _predict_loader(self, loader: DataLoader):
-        """Внутренний helper: прогон по DataLoader с group-батчами,
-        возвращает (scores, labels, groups) для расчёта метрик."""
-        self._model.eval()
-        S, L, G = [], [], []
-        with torch.no_grad():
-            for u, i, n, y, g in loader:
-                u = u.to(self._device); i = i.to(self._device); n = n.to(self._device)
-                S.append(self._model(u, i, n).cpu().numpy())
-                L.append(y.numpy()); G.append(g.numpy())
-        return np.concatenate(S), np.concatenate(L), np.concatenate(G)
