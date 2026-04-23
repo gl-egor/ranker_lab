@@ -483,6 +483,21 @@ def train_neural_ranker(
 
     t0 = time.time()
     for epoch in trange(1, params["max_epochs"] + 1, desc="epoch", unit="ep"):
+
+        if params.get("resample_each_epoch", False) and make_row_fn is not None:
+            current_train_df = resample_negatives_hard(
+                train_df=train_df,
+                model=model,
+                forward_fn=forward_fn,
+                feature_spec=feature_spec,
+                make_row_fn=make_row_fn,
+                n_neg=n_neg,
+                hard_ratio=0.0,
+                device=device,
+                seed=seed + epoch,
+            )
+            train_loader = _make_loader(current_train_df, shuffle=True,
+                                        loader_seed=seed + epoch)
         
         # ── Hard mining: пересэмплируем негативы после warmup ───────────
         if use_hard_mining and epoch > hard_mining_warmup:
