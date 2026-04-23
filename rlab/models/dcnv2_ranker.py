@@ -69,8 +69,7 @@ def make_feature_row_wrapper(
         group_id=group_id,
     )
 
-def _build_make_row_fn(
-    self,
+def build_make_row_fn(
     train_df: pd.DataFrame,
     feature_spec: FeatureSpec,
 ) -> callable:
@@ -251,7 +250,7 @@ class DCNv2Ranker(Ranker):
 
         make_row_fn = None
         if p.get("hard_mining", False):
-            make_row_fn = _build_make_row_fn(train_df, feature_spec)
+            make_row_fn = build_make_row_fn(train_df, feature_spec)
 
         # Тренировка через общий loop
         return train_neural_ranker(
