@@ -251,7 +251,7 @@ class DCNv2Ranker(Ranker):
 
         make_row_fn = None
         if p.get("hard_mining", False):
-            make_row_fn = self._build_make_row_fn(train_df, feature_spec)
+            make_row_fn = _build_make_row_fn(train_df, feature_spec)
 
         # Тренировка через общий loop
         return train_neural_ranker(
