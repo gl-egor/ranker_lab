@@ -484,7 +484,7 @@ def train_neural_ranker(
     t0 = time.time()
     for epoch in trange(1, params["max_epochs"] + 1, desc="epoch", unit="ep"):
 
-        if params.get("resample_each_epoch", False) and make_row_fn is not None:
+        if params.get("resample_each_epoch", False) and make_row_fn is not None and epoch > 1:
             current_train_df = resample_negatives_hard(
                 train_df=train_df,
                 model=model,
@@ -495,6 +495,7 @@ def train_neural_ranker(
                 hard_ratio=0.0,
                 device=device,
                 seed=seed + epoch,
+                n_candidates=n_candidates
             )
             train_loader = _make_loader(current_train_df, shuffle=True,
                                         loader_seed=seed + epoch)
