@@ -153,6 +153,10 @@ class RunRecord:
     train_size: int
     seed: int
 
+    #warm validation
+    n_eval_groups: int = 0
+    n_total_groups: int = 0
+
     # ─── общие метрики (весь тест) ───────────────────────────────────────────
     ndcg_at_k: float
     hr_at_k: float
@@ -172,7 +176,7 @@ class RunRecord:
     train_time_sec: float = 0.0
     n_params: int = 0
 
-    # ─── на всякий случай — произвольные поля от конкретной модели ───────────
+    # ─── произвольные поля от конкретной модели ───────────
     extras: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict:

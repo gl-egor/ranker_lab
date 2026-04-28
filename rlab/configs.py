@@ -84,6 +84,7 @@ class EvalConfig:
     n_pop_bins: int = 4
     bootstrap_n: int = 1000
     bootstrap_alpha: float = 0.05
+    eval_warm_only: bool = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────

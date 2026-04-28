@@ -112,6 +112,60 @@ def run_experiment(cfg: ExperimentConfig, *, skip_if_exists: bool = True) -> Run
 
     # ─── 4. Инференс на тесте ────────────────────────────────────────────
     test_scores = model.predict(test_df, feature_spec)
+
+    def _apply_warm_filter(train_df, test_df, test_scores, cfg):
+        """
+        Если eval_warm_only=True, оставляем в тесте только группы,
+        где user_idx встречался хотя бы в одной train-группе.
+    
+        Возвращает отфильтрованные (test_df, test_scores, n_total, n_warm).
+    
+        Почему фильтруем по group_id, а не по строкам:
+            Каждая группа = 1 позитив + 50 негативов для одного юзера.
+            Если убрать группу частично, NDCG посчитается неправильно.
+            Поэтому убираем целые группы.
+    
+        Почему НЕ фильтруем train/valid:
+            train — по определению «тёплый» (все юзеры в нём есть).
+            valid — используется для early stopping, фильтровать его
+            опасно (модель может остановиться на другой эпохе). Если
+            нужно — можно добавить аналогичный фильтр, но для диплома
+            достаточно фильтрации теста.
+        """
+        import numpy as np
+    
+        n_total = test_df[cfg.eval.group_col if hasattr(cfg.eval, 'group_col')
+                        else "group_id"].nunique()
+    
+        if not cfg.eval.eval_warm_only:
+            return test_df, test_scores, n_total, n_total
+    
+        # Юзеры, встретившиеся в train
+        # train_df содержит колонку user_idx (если feature_set включает ids)
+        if "user_idx" not in train_df.columns:
+            print("[warn] eval_warm_only=True, но user_idx нет в train_df. "
+                "feature_set должна включать 'ids'.")
+            return test_df, test_scores, n_total, n_total
+    
+        warm_users = set(train_df["user_idx"].unique())
+    
+        # Группы с тёплыми юзерами
+        group_col = "group_id"
+        warm_mask = test_df["user_idx"].isin(warm_users)
+        warm_groups = set(test_df.loc[warm_mask, group_col].unique())
+    
+        # Фильтруем целые группы
+        keep_mask = test_df[group_col].isin(warm_groups).values
+        test_df_warm = test_df[keep_mask].reset_index(drop=True)
+        test_scores_warm = test_scores[keep_mask]
+    
+        n_warm = test_df_warm[group_col].nunique()
+        print(f"[eval] warm filter: {n_warm}/{n_total} groups "
+            f"({100*n_warm/n_total:.1f}% coverage)")
+    
+        return test_df_warm, test_scores_warm, n_total, n_warm
+    
+    test_df, test_scores, n_total_groups, n_eval_groups = _apply_warm_filter(train_df, test_df, test_scores, cfg)
     test_labels = test_df[feature_spec.target_col].values
     test_groups = test_df[feature_spec.group_col].values
 
@@ -170,6 +224,8 @@ def run_experiment(cfg: ExperimentConfig, *, skip_if_exists: bool = True) -> Run
         n_groups_by_pop_bin=n_groups_by_bin,
         train_time_sec=float(fit_meta.get("train_time_sec", 0.0)),
         n_params=model.n_params(),
+        n_eval_groups=n_eval_groups,
+        n_total_groups=n_total_groups,
         extras=fit_meta,
     )
 
