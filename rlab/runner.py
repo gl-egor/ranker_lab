@@ -111,7 +111,41 @@ def run_experiment(cfg: ExperimentConfig, *, skip_if_exists: bool = True) -> Run
     )
 
     # ─── 4. Инференс на тесте ────────────────────────────────────────────
-    test_scores = model.predict(test_df, feature_spec)
+    inference_latency_mean_ms = inference_latency_p95_ms = None
+    inference_total_sec = None
+
+    if cfg.eval.measure_inference_latency:
+        from time import perf_counter
+
+        from rlab.eval.latency import (
+            inference_timer,
+            make_latency_sample,
+            measure_inference_latency,
+        )
+        sample_df = make_latency_sample(
+            valid_df, feature_spec, n_groups=cfg.eval.latency_sample_groups,
+        )
+        lat = measure_inference_latency(
+            model,
+            sample_df,
+            feature_spec,
+            num_runs=cfg.eval.latency_num_runs,
+            warmup_runs=cfg.eval.latency_warmup_runs,
+            model_kind=cfg.model.kind,
+            name=f"{cfg.model.kind} (valid sample)",
+        )
+        inference_latency_mean_ms = lat["mean_ms"]
+        inference_latency_p95_ms = lat["p95_ms"]
+
+        from rlab.eval.latency import _sync_after_predict, is_pytorch_ranker
+
+        with inference_timer(f"test predict ({len(test_df)} rows)"):
+            t0 = perf_counter()
+            test_scores = model.predict(test_df, feature_spec)
+            _sync_after_predict(is_pytorch_ranker(model, cfg.model.kind))
+            inference_total_sec = perf_counter() - t0
+    else:
+        test_scores = model.predict(test_df, feature_spec)
 
     def _apply_warm_filter(train_df, test_df, test_scores, cfg):
         """
@@ -168,6 +202,33 @@ def run_experiment(cfg: ExperimentConfig, *, skip_if_exists: bool = True) -> Run
     test_df, test_scores, n_total_groups, n_eval_groups = _apply_warm_filter(train_df, test_df, test_scores, cfg)
     test_labels = test_df[feature_spec.target_col].values
     test_groups = test_df[feature_spec.group_col].values
+
+    # ─── 4b. Предсказания и diversity-метрики ───────────────────────────
+    coverage_at_k = epc_at_k = None
+    if "item_idx" in test_df.columns:
+        from rlab.eval.predictions import build_predictions_df, save_predictions_df
+        from rlab.eval.diversity import diversity_metrics
+
+        df_preds = build_predictions_df(test_df, test_scores, feature_spec)
+
+        if cfg.eval.save_predictions:
+            pred_path = run_dir / f"preds_{cfg.model.kind}_test.parquet"
+            save_predictions_df(df_preds, pred_path)
+            print(f"[eval] predictions saved → {pred_path}")
+
+        if feature_spec.train_aggregates is not None:
+            catalog = set(range(1, feature_spec.cardinalities["item_idx"]))
+            div = diversity_metrics(
+                df_preds,
+                k=cfg.eval.k,
+                catalog_items=catalog,
+                train_item_popularity=feature_spec.train_aggregates.item_popularity,
+            )
+            coverage_at_k = div["coverage_at_k"]
+            epc_at_k = div["epc_at_k"]
+    elif cfg.eval.save_predictions:
+        print("[warn] save_predictions=True, но item_idx нет в test_df. "
+              "feature_set должна включать 'ids'.")
 
     # ─── 5. Метрики ──────────────────────────────────────────────────────
     # Считаем в три прохода: общие, CI через bootstrap, стратификация.
@@ -226,6 +287,11 @@ def run_experiment(cfg: ExperimentConfig, *, skip_if_exists: bool = True) -> Run
         n_params=model.n_params(),
         n_eval_groups=n_eval_groups,
         n_total_groups=n_total_groups,
+        coverage_at_k=coverage_at_k,
+        epc_at_k=epc_at_k,
+        inference_latency_mean_ms=inference_latency_mean_ms,
+        inference_latency_p95_ms=inference_latency_p95_ms,
+        inference_total_sec=inference_total_sec,
         extras=fit_meta,
     )
 
@@ -266,5 +332,12 @@ def _row_to_record(row: dict) -> RunRecord:
         ndcg_by_pop_bin=ndcg_bins, n_groups_by_pop_bin=n_groups_bins,
         train_time_sec=float(row.get("train_time_sec", 0.0)),
         n_params=int(row.get("n_params", 0)),
+        n_eval_groups=int(row.get("n_eval_groups", 0)),
+        n_total_groups=int(row.get("n_total_groups", 0)),
+        coverage_at_k=row.get("coverage_at_k"),
+        epc_at_k=row.get("epc_at_k"),
+        inference_latency_mean_ms=row.get("inference_latency_mean_ms"),
+        inference_latency_p95_ms=row.get("inference_latency_p95_ms"),
+        inference_total_sec=row.get("inference_total_sec"),
         extras=extras,
     )

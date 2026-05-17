@@ -78,6 +78,11 @@ class EvalConfig:
     n_pop_bins      : число бинов популярности (4 = квартили).
     bootstrap_n     : число bootstrap-ресэмплов для CI (H1). 0 = выключить.
     bootstrap_alpha : уровень значимости (0.05 = 95% CI).
+    save_predictions: писать preds_<model>_test.parquet в runs/<run_id>/.
+    measure_inference_latency: микробенчмарк predict (mean/p95 ms) + время полного теста.
+    latency_num_runs     : итераций микробенчмарка.
+    latency_warmup_runs  : прогрев до замера.
+    latency_sample_groups: сколько query-групп в одном sample для бенчмарка.
     """
     k: int = 10
     stratify_by_pop: bool = True
@@ -85,6 +90,11 @@ class EvalConfig:
     bootstrap_n: int = 1000
     bootstrap_alpha: float = 0.05
     eval_warm_only: bool = False
+    save_predictions: bool = False
+    measure_inference_latency: bool = False
+    latency_num_runs: int = 100
+    latency_warmup_runs: int = 10
+    latency_sample_groups: int = 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────

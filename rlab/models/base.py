@@ -176,6 +176,15 @@ class RunRecord:
     n_eval_groups: int = 0
     n_total_groups: int = 0
 
+    # ─── diversity (Coverage, EPC) ───────────────────────────────────────────
+    coverage_at_k: float | None = None
+    epc_at_k: float | None = None
+
+    # ─── inference latency ───────────────────────────────────────────────────
+    inference_latency_mean_ms: float | None = None
+    inference_latency_p95_ms: float | None = None
+    inference_total_sec: float | None = None
+
     # ─── произвольные поля от конкретной модели ───────────
     extras: dict[str, Any] = field(default_factory=dict)
 
@@ -211,6 +220,17 @@ class RunRecord:
                 f"{k}={v:.4f}" for k, v in self.ndcg_by_pop_bin.items()
             )
             lines.append(f"  NDCG by pop: {bins}")
+        if self.coverage_at_k is not None:
+            lines.append(
+                f"  Coverage@{self.k}={self.coverage_at_k:.4f}  "
+                f"EPC@{self.k}={self.epc_at_k:.4f}"
+            )
+        if self.inference_latency_mean_ms is not None:
+            lines.append(
+                f"  Inference: mean={self.inference_latency_mean_ms:.2f} ms  "
+                f"p95={self.inference_latency_p95_ms:.2f} ms  "
+                f"full_test={self.inference_total_sec:.2f}s"
+            )
         lines.append(
             f"  time={self.train_time_sec:.1f}s  params={self.n_params:,}"
         )
