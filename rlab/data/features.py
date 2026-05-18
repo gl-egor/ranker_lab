@@ -23,11 +23,8 @@ import pandas as pd
 # ─────────────────────────────────────────────────────────────────────────────
 # При добавлении новой фичи: (1) сгенерировать её в build_rank_table_rows,
 # (2) вписать в нужную группу ниже.
-# Остаются в DataFrame для post-hoc анализа предсказаний,
-# даже если feature_set не включает ids во вход модели.
-METADATA_COLS: list[str] = ["user_idx", "item_idx"]
-
 FEATURE_GROUPS: dict[str, list[str]] = {
+    # ids: метаданные для сохранения предсказаний при любом feature_set
     "ids":        ["user_idx", "item_idx"],
     "user_stats": ["history_len", "user_mean_rating", "user_interaction_count"],
     "item_stats": ["item_popularity", "item_popularity_log", "item_mean_rating"],
@@ -59,6 +56,10 @@ def resolve_feature_set(name: str) -> list[str]:
                 cols.append(col)
                 seen.add(col)
     return cols
+
+
+# Алиас для loader / post-hoc анализа (совместимость)
+METADATA_COLS: list[str] = FEATURE_GROUPS["ids"]
 
 
 def categorical_cols_in(feature_cols: list[str]) -> list[str]:
