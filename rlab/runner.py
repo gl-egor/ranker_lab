@@ -203,32 +203,29 @@ def run_experiment(cfg: ExperimentConfig, *, skip_if_exists: bool = True) -> Run
     test_labels = test_df[feature_spec.target_col].values
     test_groups = test_df[feature_spec.group_col].values
 
-    # ─── 4b. Предсказания и diversity-метрики ───────────────────────────
+    # ─── 4b. Предсказания на тесте и diversity-метрики ───────────────────
+    from rlab.eval.predictions import build_predictions_df, save_split_predictions
+    from rlab.eval.diversity import diversity_metrics
+
     coverage_at_k = epc_at_k = None
-    if "item_idx" in test_df.columns:
-        from rlab.eval.predictions import build_predictions_df, save_predictions_df
-        from rlab.eval.diversity import diversity_metrics
+    df_preds = build_predictions_df(test_df, test_scores, feature_spec)
 
-        df_preds = build_predictions_df(test_df, test_scores, feature_spec)
+    if cfg.eval.save_predictions:
+        save_split_predictions(
+            model, test_df, feature_spec, run_dir, cfg.model.kind, "test",
+            scores=test_scores,
+        )
 
-        if cfg.eval.save_predictions:
-            pred_path = run_dir / f"preds_{cfg.model.kind}_test.parquet"
-            save_predictions_df(df_preds, pred_path)
-            print(f"[eval] predictions saved → {pred_path}")
-
-        if feature_spec.train_aggregates is not None:
-            catalog = set(range(1, feature_spec.cardinalities["item_idx"]))
-            div = diversity_metrics(
-                df_preds,
-                k=cfg.eval.k,
-                catalog_items=catalog,
-                train_item_popularity=feature_spec.train_aggregates.item_popularity,
-            )
-            coverage_at_k = div["coverage_at_k"]
-            epc_at_k = div["epc_at_k"]
-    elif cfg.eval.save_predictions:
-        print("[warn] save_predictions=True, но item_idx нет в test_df. "
-              "feature_set должна включать 'ids'.")
+    if "item_idx" in df_preds.columns and feature_spec.train_aggregates is not None:
+        catalog = set(range(1, feature_spec.cardinalities["item_idx"]))
+        div = diversity_metrics(
+            df_preds,
+            k=cfg.eval.k,
+            catalog_items=catalog,
+            train_item_popularity=feature_spec.train_aggregates.item_popularity,
+        )
+        coverage_at_k = div["coverage_at_k"]
+        epc_at_k = div["epc_at_k"]
 
     # ─── 5. Метрики ──────────────────────────────────────────────────────
     # Считаем в три прохода: общие, CI через bootstrap, стратификация.

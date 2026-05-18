@@ -40,6 +40,7 @@ from rlab.data.features import (
     TrainAggregates,
     categorical_cols_in,
     compute_train_aggregates,
+    METADATA_COLS,
     make_feature_row,
     numerical_cols_in,
     resolve_feature_set,
@@ -344,8 +345,11 @@ def load_dataset(
             pickle.dump(agg, f)
 
     # ── Apply feature_set (пост-фильтр колонок) ──────────────────────────
+    # METADATA_COLS остаются для сохранения предсказаний при любом feature_set.
     feature_cols = resolve_feature_set(data_cfg.feature_set)
-    keep_cols = ["group_id", "label"] + feature_cols
+    keep_cols = list(dict.fromkeys(
+        ["group_id", "label"] + METADATA_COLS + feature_cols
+    ))
     train = train[keep_cols].copy()
     valid = valid[keep_cols].copy()
     test  = test[keep_cols].copy()

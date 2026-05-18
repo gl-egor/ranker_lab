@@ -78,7 +78,7 @@ class EvalConfig:
     n_pop_bins      : число бинов популярности (4 = квартили).
     bootstrap_n     : число bootstrap-ресэмплов для CI (H1). 0 = выключить.
     bootstrap_alpha : уровень значимости (0.05 = 95% CI).
-    save_predictions: писать preds_<model>_test.parquet в runs/<run_id>/.
+    save_predictions: preds_<model>_test.parquet (group_id, label, pred, user/item_idx).
     measure_inference_latency: микробенчмарк predict (mean/p95 ms) + время полного теста.
     latency_num_runs     : итераций микробенчмарка.
     latency_warmup_runs  : прогрев до замера.

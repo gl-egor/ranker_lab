@@ -23,6 +23,10 @@ import pandas as pd
 # ─────────────────────────────────────────────────────────────────────────────
 # При добавлении новой фичи: (1) сгенерировать её в build_rank_table_rows,
 # (2) вписать в нужную группу ниже.
+# Остаются в DataFrame для post-hoc анализа предсказаний,
+# даже если feature_set не включает ids во вход модели.
+METADATA_COLS: list[str] = ["user_idx", "item_idx"]
+
 FEATURE_GROUPS: dict[str, list[str]] = {
     "ids":        ["user_idx", "item_idx"],
     "user_stats": ["history_len", "user_mean_rating", "user_interaction_count"],
