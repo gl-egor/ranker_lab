@@ -29,8 +29,10 @@ class DataConfig:
     valid_size   : фиксируем, чтобы по разным train_size сравнивать
                    на одной и той же валидации.
     test_size    : аналогично.
-    feature_set  : имя набора фичей из feature_groups (см. FeatureConfig).
-                   Для H3 sweep'им между 'full' и 'no_cross'.
+    feature_set  : имя набора из FEATURE_SETS (features.py).
+                   'full' | 'no_cross' | 'ids_only' | 'no_hc_features' | ...
+                   no_hc_features — ids + user_mean_rating + item_popularity
+                   (явные аналоги target encoding CatBoost для сравнения с DCN).
     n_neg_train  : кол-во негативов на позитив в train.
     n_neg_eval   : то же для valid/test (обычно больше, например 50-100).
     neg_strategy : 'random' | 'popularity' | 'hard'. Hard требует тёплого старта.
