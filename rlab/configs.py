@@ -58,7 +58,7 @@ class DataConfig:
 @dataclass
 class ModelConfig:
     """
-    kind   : 'catboost' | 'dcnv2' | 'deepfm'. По этому ключу
+    kind   : 'catboost' | 'dcnv2' | 'dcnv2_reg' | 'deepfm'. По этому ключу
              runner выбирает реализацию из rlab.models.
     params : словарь гиперпараметров модели. Каждая модель сама знает,
              какие ключи она ждёт (см. её from_config).

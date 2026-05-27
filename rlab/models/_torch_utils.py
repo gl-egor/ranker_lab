@@ -111,6 +111,96 @@ def group_softmax_loss(
     return torch.stack(losses).mean()
 
 
+def popularity_regularization_term(
+    scores: torch.Tensor,
+    groups: torch.Tensor,
+    item_pop: torch.Tensor,
+) -> torch.Tensor:
+    """
+    RegTerm = - mean_u cos(scores_u, pop_u) по группам в батче.
+    Минус нужен, т.к. общая цель минимизируется.
+    """
+    unique = torch.unique(groups)
+    regs = []
+    for gid in unique:
+        mask = groups == gid
+        regs.append(-F.cosine_similarity(scores[mask], item_pop[mask], dim=0))
+    return torch.stack(regs).mean()
+
+
+def _compute_item_popularity_logits(train_df: pd.DataFrame) -> dict[int, float]:
+    """
+    Лог-популярность айтемов по позитивам train rank_table:
+        pop_i = log(count_i + 1)
+    """
+    if "item_idx" not in train_df.columns:
+        raise ValueError("train_df must contain item_idx for popularity-based methods")
+    pos = train_df[train_df["label"] == 1]
+    counts = pos.groupby("item_idx").size()
+    return {int(i): float(np.log1p(c)) for i, c in counts.items()}
+
+
+def resample_negatives_popularity(
+    *,
+    train_df: pd.DataFrame,
+    feature_spec: FeatureSpec,
+    make_row_fn: Callable[[int, int, int, int], dict],
+    n_neg: int,
+    seed: int,
+    item_pop_logits: dict[int, float],
+) -> pd.DataFrame:
+    """
+    Пересэмплинг негативов с вероятностями, пропорциональными популярности.
+    Для каждого пользователя исключаем его train-историю и позитив.
+    """
+    rng = np.random.default_rng(seed)
+    group_col = feature_spec.group_col
+    target_col = feature_spec.target_col
+
+    pos_df = (
+        train_df[train_df[target_col] == 1][["user_idx", "item_idx", group_col]]
+        .sort_values(group_col)
+        .reset_index(drop=True)
+    )
+    user_histories: dict[int, set[int]] = (
+        pos_df.groupby("user_idx")["item_idx"].agg(lambda s: set(int(x) for x in s)).to_dict()
+    )
+    item_pool = np.sort(train_df["item_idx"].unique()).astype(np.int64)
+    pool_weights = np.asarray(
+        [item_pop_logits.get(int(i), 0.0) for i in item_pool], dtype=np.float64
+    )
+    if pool_weights.sum() <= 0:
+        pool_weights = np.ones_like(pool_weights, dtype=np.float64)
+
+    rows: list[dict] = []
+    for _, row in pos_df.iterrows():
+        u = int(row["user_idx"])
+        pos_item = int(row["item_idx"])
+        gid = int(row[group_col])
+        rows.append(make_row_fn(u, pos_item, 1, gid))
+
+        forbidden = set(user_histories.get(u, set()))
+        forbidden.add(pos_item)
+        allowed_mask = ~np.isin(item_pool, np.fromiter(forbidden, dtype=np.int64))
+        allowed_items = item_pool[allowed_mask]
+        allowed_weights = pool_weights[allowed_mask]
+
+        if len(allowed_items) == 0:
+            continue
+        if allowed_weights.sum() <= 0:
+            allowed_weights = np.ones_like(allowed_weights, dtype=np.float64)
+        probs = allowed_weights / allowed_weights.sum()
+
+        replace = len(allowed_items) < n_neg
+        sampled = rng.choice(allowed_items, size=n_neg, replace=replace, p=probs)
+        for it in sampled:
+            rows.append(make_row_fn(u, int(it), 0, gid))
+
+    out = pd.DataFrame(rows)
+    out = out.sort_values([group_col, target_col], ascending=[True, False]).reset_index(drop=True)
+    return out
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Hard Negative Mining (v2: per-user, с пересборкой фичей)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -415,11 +505,14 @@ def train_neural_ranker(
     hard_mining_warmup = params.get("hard_mining_warmup", 2)
     hard_ratio = params.get("hard_ratio", 0.5)
     n_candidates = params.get("hard_mining_n_candidates", 200)
+    use_pop_weighted_sampler = params.get("pop_weighted_sampler", False)
+    pop_refresh_each_epoch = params.get("pop_resample_each_epoch", False)
+    pop_reg_alpha = float(params.get("pop_reg_alpha", 0.0))
 
-    if use_hard_mining and make_row_fn is None:
+    if (use_hard_mining or use_pop_weighted_sampler) and make_row_fn is None:
         raise ValueError(
-            "hard_mining=True требует make_row_fn для корректного "
-            "пересчёта item-фичей. Передайте callback из features.py."
+            "hard_mining/pop_weighted_sampler требуют make_row_fn для "
+            "корректного пересчёта item-фичей."
         )
     
     # Определяем n_neg из train_df
@@ -428,6 +521,7 @@ def train_neural_ranker(
     
     # n_items для compute_item_scores
     n_items = feature_spec.cardinalities.get("item_idx", train_df["item_idx"].max() + 1)
+    item_pop_logits = _compute_item_popularity_logits(train_df)
 
     # ── Создаём DataLoaders ─────────────────────────────────────────────
     def _make_loader(df: pd.DataFrame, shuffle: bool, loader_seed: int) -> DataLoader:
@@ -444,6 +538,15 @@ def train_neural_ranker(
 
     # Train loader будет пересоздаваться при hard mining
     current_train_df = train_df.copy()
+    if use_pop_weighted_sampler:
+        current_train_df = resample_negatives_popularity(
+            train_df=train_df,
+            feature_spec=feature_spec,
+            make_row_fn=make_row_fn,
+            n_neg=n_neg,
+            seed=seed,
+            item_pop_logits=item_pop_logits,
+        )
     train_loader = _make_loader(current_train_df, shuffle=True, loader_seed=seed)
     
     # Valid loader фиксирован
@@ -499,6 +602,17 @@ def train_neural_ranker(
             )
             train_loader = _make_loader(current_train_df, shuffle=True,
                                         loader_seed=seed + epoch)
+
+        if use_pop_weighted_sampler and pop_refresh_each_epoch and epoch > 1:
+            current_train_df = resample_negatives_popularity(
+                train_df=train_df,
+                feature_spec=feature_spec,
+                make_row_fn=make_row_fn,
+                n_neg=n_neg,
+                seed=seed + epoch,
+                item_pop_logits=item_pop_logits,
+            )
+            train_loader = _make_loader(current_train_df, shuffle=True, loader_seed=seed + epoch)
         
         # ── Hard mining: пересэмплируем негативы после warmup ───────────
         if use_hard_mining and epoch > hard_mining_warmup:
@@ -527,7 +641,17 @@ def train_neural_ranker(
             y, g    = y.to(device), g.to(device)
 
             scores = forward_fn(model, u, i, n)
-            loss = group_softmax_loss(scores, y, g)
+            base_loss = group_softmax_loss(scores, y, g)
+            if pop_reg_alpha > 0.0:
+                pop = torch.tensor(
+                    [item_pop_logits.get(int(x), 0.0) for x in i.detach().cpu().numpy()],
+                    dtype=scores.dtype,
+                    device=device,
+                )
+                reg_term = popularity_regularization_term(scores, g, pop)
+                loss = (1.0 - pop_reg_alpha) * base_loss + pop_reg_alpha * reg_term
+            else:
+                loss = base_loss
 
             opt.zero_grad()
             loss.backward()
