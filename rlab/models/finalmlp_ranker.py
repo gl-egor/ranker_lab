@@ -40,6 +40,20 @@ class MLP(nn.Module):
         return self.mlp(x)
 
 
+class FeatureSelectionGate(nn.Module):
+    """Механизм гейтирования признаков из статьи FinalMLP."""
+
+    def __init__(self, input_dim: int):
+        super().__init__()
+        self.gate = nn.Linear(input_dim, input_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Умножаем на 2, чтобы среднее значение весов после сигмоиды было около 1.
+        # Это сохраняет масштаб исходных признаков на старте обучения.
+        weight = torch.sigmoid(self.gate(x)) * 2.0
+        return x * weight
+
+
 class MultiHeadBilinearFusion(nn.Module):
     """Multi-head bilinear fusion from FinalMLP."""
 
@@ -51,10 +65,12 @@ class MultiHeadBilinearFusion(nn.Module):
         self.p2 = nn.Parameter(torch.empty(dim2, 1))
         self.bias = nn.Parameter(torch.zeros(1))
 
-        nn.init.xavier_uniform_(self.W)
-        nn.init.xavier_uniform_(self.c)
-        nn.init.xavier_uniform_(self.p1)
-        nn.init.xavier_uniform_(self.p2)
+        # He-style init для W — учитывает оба измерения входа
+        nn.init.normal_(self.W, mean=0.0, std=np.sqrt(2.0 / (dim1 + dim2)))
+        # Малый std для проекционных весов — стабильный старт fusion
+        nn.init.normal_(self.c, mean=0.0, std=0.01)
+        nn.init.normal_(self.p1, mean=0.0, std=0.01)
+        nn.init.normal_(self.p2, mean=0.0, std=0.01)
 
     def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
         interactions = torch.einsum("bi,kij,bj->bk", x1, self.W, x2)
@@ -68,6 +84,9 @@ class FinalMLP(nn.Module):
     """
     Two-stream MLP over concatenated user/item embeddings and numerical features,
     followed by multi-head bilinear fusion.
+
+    Each stream receives its own feature-gated view of the shared input,
+    allowing the model to learn stream-specific feature importance independently.
     """
 
     def __init__(
@@ -90,6 +109,10 @@ class FinalMLP(nn.Module):
         self.ln = nn.LayerNorm(input_dim) if layer_norm else nn.Identity()
         self.drop = nn.Dropout(dropout)
 
+        # Независимые гейты: каждый поток учится выбирать свои признаки
+        self.gate1 = FeatureSelectionGate(input_dim)
+        self.gate2 = FeatureSelectionGate(input_dim)
+
         self.stream1 = MLP(input_dim, mlp1_hidden, dropout)
         self.stream2 = MLP(input_dim, mlp2_hidden, dropout)
         self.fusion = MultiHeadBilinearFusion(
@@ -109,8 +132,9 @@ class FinalMLP(nn.Module):
         x = torch.cat([u, i, num_feat], dim=-1)
         x = self.drop(self.ln(x))
 
-        out1 = self.stream1(x)
-        out2 = self.stream2(x)
+        # Каждый поток получает свою взвешенную версию входа
+        out1 = self.stream1(self.gate1(x))
+        out2 = self.stream2(self.gate2(x))
         return self.fusion(out1, out2)
 
 
