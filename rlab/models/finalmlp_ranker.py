@@ -41,15 +41,24 @@ class MLP(nn.Module):
 
 
 class FeatureSelectionGate(nn.Module):
-    """Механизм гейтирования признаков из статьи FinalMLP."""
+    """Bottleneck feature gating (Mao et al., 2023 — FinalMLP).
 
-    def __init__(self, input_dim: int):
+    Двухслойный гейт с промежуточным сжатием (bottleneck) вместо
+    одного Linear. Bottleneck не даёт гейту вырождаться в тождественное
+    преобразование и заставляет каждый поток выбирать компактное
+    подмножество признаков.
+    """
+
+    def __init__(self, input_dim: int, reduction: int = 4):
         super().__init__()
-        self.gate = nn.Linear(input_dim, input_dim)
+        hidden = max(input_dim // reduction, 16)
+        self.gate = nn.Sequential(
+            nn.Linear(input_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, input_dim),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Умножаем на 2, чтобы среднее значение весов после сигмоиды было около 1.
-        # Это сохраняет масштаб исходных признаков на старте обучения.
         weight = torch.sigmoid(self.gate(x)) * 2.0
         return x * weight
 
@@ -100,6 +109,7 @@ class FinalMLP(nn.Module):
         num_heads: int = 4,
         dropout: float = 0.1,
         layer_norm: bool = True,
+        gate_reduction: int = 4,
     ):
         super().__init__()
         self.user_emb = nn.Embedding(n_users, emb_dim, padding_idx=0)
@@ -109,9 +119,8 @@ class FinalMLP(nn.Module):
         self.ln = nn.LayerNorm(input_dim) if layer_norm else nn.Identity()
         self.drop = nn.Dropout(dropout)
 
-        # Независимые гейты: каждый поток учится выбирать свои признаки
-        self.gate1 = FeatureSelectionGate(input_dim)
-        self.gate2 = FeatureSelectionGate(input_dim)
+        self.gate1 = FeatureSelectionGate(input_dim, reduction=gate_reduction)
+        self.gate2 = FeatureSelectionGate(input_dim, reduction=gate_reduction)
 
         self.stream1 = MLP(input_dim, mlp1_hidden, dropout)
         self.stream2 = MLP(input_dim, mlp2_hidden, dropout)
@@ -145,6 +154,7 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "num_heads": 4,
     "dropout": 0.1,
     "layer_norm": True,
+    "gate_reduction": 4,
     "lr": 1e-3,
     "emb_lr_mult": 1.0,
     "emb_weight_decay": None,
@@ -191,6 +201,7 @@ class FinalMLPRanker(Ranker):
             num_heads=p["num_heads"],
             dropout=p["dropout"],
             layer_norm=p["layer_norm"],
+            gate_reduction=p.get("gate_reduction", 4),
         ).to(self._device)
 
         make_row_fn = None

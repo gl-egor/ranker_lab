@@ -128,6 +128,50 @@ def popularity_regularization_term(
     return torch.stack(regs).mean()
 
 
+def ips_group_softmax_loss(
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+    groups: torch.Tensor,
+    item_idx: torch.Tensor,
+    item_pop_logits: dict[int, float],
+    beta: float = 0.5,
+    max_weight: float = 10.0,
+) -> torch.Tensor:
+    """IPS-reweighted listwise loss (Inverse Propensity Scoring).
+
+    Каждая группа получает вес, обратно пропорциональный популярности
+    её позитивного айтема:  w_g = 1 / (count_pos + 1)^beta.
+    Веса нормализуются к среднему=1 и клиппируются max_weight,
+    чтобы снизить дисперсию градиентов.
+
+    Теоретическое обоснование: Schnabel et al., 2016; Saito, 2020 —
+    IPS корректирует смещение, вызванное popularity bias в данных,
+    позволяя модели лучше обучаться на tail-айтемах.
+    """
+    unique = torch.unique(groups)
+    losses: list[torch.Tensor] = []
+    raw_weights: list[float] = []
+    for gid in unique:
+        mask = groups == gid
+        log_prob = F.log_softmax(scores[mask], dim=0)
+        losses.append(-(log_prob * labels[mask]).sum())
+
+        pos_mask = labels[mask] > 0
+        if pos_mask.any():
+            pos_item = item_idx[mask][pos_mask][0].item()
+            pop_logit = item_pop_logits.get(int(pos_item), 0.0)
+            count = np.expm1(pop_logit)  # log1p inverse → raw count
+            w = 1.0 / (count + 1.0) ** beta
+        else:
+            w = 1.0
+        raw_weights.append(w)
+
+    losses_t = torch.stack(losses)
+    weights = torch.tensor(raw_weights, device=scores.device, dtype=scores.dtype)
+    weights = torch.clamp(weights / weights.mean(), max=max_weight)
+    return (losses_t * weights).mean()
+
+
 def _compute_item_popularity_logits(train_df: pd.DataFrame) -> dict[int, float]:
     """
     Лог-популярность айтемов по позитивам train rank_table:
@@ -508,6 +552,7 @@ def train_neural_ranker(
     use_pop_weighted_sampler = params.get("pop_weighted_sampler", False)
     pop_refresh_each_epoch = params.get("pop_resample_each_epoch", False)
     pop_reg_alpha = float(params.get("pop_reg_alpha", 0.0))
+    ips_beta = float(params.get("ips_beta", 0.0))
 
     if (use_hard_mining or use_pop_weighted_sampler) and make_row_fn is None:
         raise ValueError(
@@ -641,7 +686,12 @@ def train_neural_ranker(
             y, g    = y.to(device), g.to(device)
 
             scores = forward_fn(model, u, i, n)
-            base_loss = group_softmax_loss(scores, y, g)
+            if ips_beta > 0.0:
+                base_loss = ips_group_softmax_loss(
+                    scores, y, g, i, item_pop_logits, beta=ips_beta,
+                )
+            else:
+                base_loss = group_softmax_loss(scores, y, g)
             if pop_reg_alpha > 0.0:
                 pop = torch.tensor(
                     [item_pop_logits.get(int(x), 0.0) for x in i.detach().cpu().numpy()],
