@@ -67,14 +67,16 @@ DCN_BASE_300K = {
     'mlp_dims': (512, 256, 128),
 }
 
-# --- FinalMLP base: emb_dim=32 (починка overfitting), bottleneck gate --------
+# --- FinalMLP 300k: emb_dim=32, умеренные MLP, сильнее emb WD ---------------
+# emb_dim=16 на 60k давало val~0.3 и переобучение — мало ёмкости при больших MLP.
+# emb_dim=64 на 300k → 81M params и ранний early stop. Компромисс: 32.
 FMLP_BASE_300K = {
     'emb_dim': 32,
-    'dropout': 0.2,
+    'dropout': 0.22,
     'layer_norm': True,
     'lr': 5e-4,
-    'emb_lr_mult': 3.0,
-    'emb_weight_decay': 1e-4,
+    'emb_lr_mult': 2.5,
+    'emb_weight_decay': 2e-4,
     'weight_decay': 1e-5,
     'grad_clip': 1.0,
     'max_epochs': 15,
@@ -82,20 +84,27 @@ FMLP_BASE_300K = {
     'groups_per_batch': 256,
     'scheduler': "warmup_cosine",
     'scheduler_kwargs': {"warmup_epochs": 2, "eta_min": 1e-5},
-    'mlp1_hidden': (512, 256, 128),
-    'mlp2_hidden': (256, 128),
+    'mlp1_hidden': (384, 192, 96),
+    'mlp2_hidden': (192, 96),
     'num_heads': 4,
     'gate_reduction': 4,
     'pop_weighted_sampler': True,
     'pop_reg_alpha': 0.01,
 }
 
+# Быстрый вариант: popularity-негативы при сборке датасета, без runtime resample
+FMLP_BASE_300K_FAST = {
+    **FMLP_BASE_300K,
+    'pop_weighted_sampler': False,
+    'pop_reg_alpha': 0.01,
+}
+
 FMLP_BASE_60K = {
     'emb_dim': 32,
-    'dropout': 0.25,
+    'dropout': 0.28,
     'layer_norm': True,
     'lr': 7e-4,
-    'emb_lr_mult': 2.5,
+    'emb_lr_mult': 2.0,
     'emb_weight_decay': 5e-4,
     'weight_decay': 1e-5,
     'grad_clip': 1.0,
@@ -104,13 +113,36 @@ FMLP_BASE_60K = {
     'groups_per_batch': 128,
     'scheduler': "warmup_cosine",
     'scheduler_kwargs': {"warmup_epochs": 2, "eta_min": 1e-5},
-    'mlp1_hidden': (384, 192),
-    'mlp2_hidden': (192, 96),
+    'mlp1_hidden': (256, 128),
+    'mlp2_hidden': (128, 64),
     'num_heads': 4,
     'gate_reduction': 4,
     'pop_weighted_sampler': True,
     'pop_reg_alpha': 0.01,
 }
+
+# DataConfig для 300k — два режима пересэмплирования
+DATA_CFG_300K = DataConfig(
+    dataset="books5",
+    train_size=300_000,
+    valid_size=10_000,
+    test_size=10_000,
+    feature_set="no_hc_features",
+    n_neg_train=5,
+    n_neg_eval=50,
+    neg_strategy="random",          # runtime pop resample в train_neural_ranker
+)
+
+DATA_CFG_300K_FAST = DataConfig(
+    dataset="books5",
+    train_size=300_000,
+    valid_size=10_000,
+    test_size=10_000,
+    feature_set="no_hc_features",
+    n_neg_train=5,
+    n_neg_eval=50,
+    neg_strategy="popularity",
+)
 
 FMLP_BASE_10K = {
     'emb_dim': 32,
@@ -382,6 +414,41 @@ def run_finalmlp_comparison():
               f"NDCG={r.ndcg_at_k:.4f}  tail={tail:.4f}  head={head:.4f}  "
               f"params={r.n_params:,}")
     return records
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Cell 5b: Один прогон FinalMLP на 300k (рекомендуемая конфигурация)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Два режима:
+#   fast=True  — neg_strategy="popularity" в loader, pop_weighted_sampler=False
+#                Самый быстрый старт (~минуты до epoch 1).
+#   fast=False — runtime pop resample с tqdm (после оптимизации ~5-15 мин).
+#
+# Рекомендация: fast=True для первого прогона, fast=False если нужен
+# точный ablation pop_weighted_sampler vs loader.
+
+def run_finalmlp_300k(seed: int = 42, fast: bool = True):
+    """FinalMLP на train_size=300k, no_hc_features."""
+
+    data_cfg = DATA_CFG_300K_FAST if fast else DATA_CFG_300K
+    params = FMLP_BASE_300K_FAST if fast else FMLP_BASE_300K
+    mode = "fast" if fast else "runtime_pop"
+
+    cfg = ExperimentConfig(
+        name=f"H12_fmlp_300k_{mode}__s{seed}",
+        data=data_cfg,
+        model=ModelConfig(kind="finalmlp", params=params),
+        eval=EVAL_CFG,
+        seed=seed,
+        output_dir=RESULTS,
+        cache_dir=CACHE,
+    )
+    print(f"\n{'='*60}")
+    print(f"  {cfg.name}")
+    print(f"  params={params}")
+    print(f"{'='*60}")
+    return run_experiment(cfg, skip_if_exists=False)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

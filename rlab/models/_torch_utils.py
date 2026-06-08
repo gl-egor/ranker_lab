@@ -184,6 +184,46 @@ def _compute_item_popularity_logits(train_df: pd.DataFrame) -> dict[int, float]:
     return {int(i): float(np.log1p(c)) for i, c in counts.items()}
 
 
+def _sample_popularity_negatives_fast(
+    forbidden: set[int],
+    item_pool: np.ndarray,
+    pool_probs: np.ndarray,
+    n_neg: int,
+    rng: np.random.Generator,
+    oversample: int = 8,
+    max_rounds: int = 20,
+) -> np.ndarray:
+    """Popularity-weighted negatives без np.isin по всему каталогу."""
+    negatives: list[int] = []
+    used: set[int] = set()
+    pool_size = len(item_pool)
+    batch = min(n_neg * oversample, pool_size)
+
+    for _ in range(max_rounds):
+        if len(negatives) >= n_neg:
+            break
+        candidates = rng.choice(
+            item_pool, size=batch, replace=True, p=pool_probs,
+        )
+        for c in candidates:
+            c_int = int(c)
+            if c_int in forbidden or c_int in used:
+                continue
+            negatives.append(c_int)
+            used.add(c_int)
+            if len(negatives) >= n_neg:
+                break
+
+    while len(negatives) < n_neg:
+        c_int = int(rng.choice(item_pool, p=pool_probs))
+        if c_int in forbidden or c_int in used:
+            continue
+        negatives.append(c_int)
+        used.add(c_int)
+
+    return np.asarray(negatives[:n_neg], dtype=np.int64)
+
+
 def resample_negatives_popularity(
     *,
     train_df: pd.DataFrame,
@@ -206,37 +246,42 @@ def resample_negatives_popularity(
         .sort_values(group_col)
         .reset_index(drop=True)
     )
-    user_histories: dict[int, set[int]] = (
-        pos_df.groupby("user_idx")["item_idx"].agg(lambda s: set(int(x) for x in s)).to_dict()
-    )
+
+    # История юзера — один проход по numpy-массивам (быстрее groupby+lambda)
+    user_histories: dict[int, set[int]] = {}
+    for u, it in zip(pos_df["user_idx"].to_numpy(), pos_df["item_idx"].to_numpy()):
+        user_histories.setdefault(int(u), set()).add(int(it))
+
     item_pool = np.sort(train_df["item_idx"].unique()).astype(np.int64)
     pool_weights = np.asarray(
         [item_pop_logits.get(int(i), 0.0) for i in item_pool], dtype=np.float64
     )
     if pool_weights.sum() <= 0:
-        pool_weights = np.ones_like(pool_weights, dtype=np.float64)
+        pool_probs = np.ones(len(item_pool), dtype=np.float64) / len(item_pool)
+    else:
+        pool_probs = pool_weights / pool_weights.sum()
 
     rows: list[dict] = []
-    for _, row in pos_df.iterrows():
-        u = int(row["user_idx"])
-        pos_item = int(row["item_idx"])
-        gid = int(row[group_col])
+    n_groups = len(pos_df)
+    for row in tqdm(
+        pos_df.itertuples(index=False),
+        total=n_groups,
+        desc="  pop resample",
+        unit="grp",
+    ):
+        u = int(row.user_idx)
+        pos_item = int(row.item_idx)
+        gid = int(getattr(row, group_col))
         rows.append(make_row_fn(u, pos_item, 1, gid))
 
-        forbidden = set(user_histories.get(u, set()))
-        forbidden.add(pos_item)
-        allowed_mask = ~np.isin(item_pool, np.fromiter(forbidden, dtype=np.int64))
-        allowed_items = item_pool[allowed_mask]
-        allowed_weights = pool_weights[allowed_mask]
-
-        if len(allowed_items) == 0:
-            continue
-        if allowed_weights.sum() <= 0:
-            allowed_weights = np.ones_like(allowed_weights, dtype=np.float64)
-        probs = allowed_weights / allowed_weights.sum()
-
-        replace = len(allowed_items) < n_neg
-        sampled = rng.choice(allowed_items, size=n_neg, replace=replace, p=probs)
+        forbidden = user_histories.get(u, set())
+        sampled = _sample_popularity_negatives_fast(
+            forbidden=forbidden,
+            item_pool=item_pool,
+            pool_probs=pool_probs,
+            n_neg=n_neg,
+            rng=rng,
+        )
         for it in sampled:
             rows.append(make_row_fn(u, int(it), 0, gid))
 
@@ -584,6 +629,8 @@ def train_neural_ranker(
     # Train loader будет пересоздаваться при hard mining
     current_train_df = train_df.copy()
     if use_pop_weighted_sampler:
+        print(f"  [pop sampler] resampling negatives for "
+              f"{train_df[feature_spec.group_col].nunique()} groups...")
         current_train_df = resample_negatives_popularity(
             train_df=train_df,
             feature_spec=feature_spec,
