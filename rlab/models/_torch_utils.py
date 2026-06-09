@@ -389,6 +389,8 @@ def train_neural_ranker(
     device: str,
     forward_fn: Callable[[nn.Module, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
     make_row_fn: Callable | None = None, #for hard mining
+    loss_fn: Callable[..., torch.Tensor] | None = None,
+    group_weights: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """
     Универсальный training loop для нейронных ранкеров.
@@ -527,7 +529,10 @@ def train_neural_ranker(
             y, g    = y.to(device), g.to(device)
 
             scores = forward_fn(model, u, i, n)
-            loss = group_softmax_loss(scores, y, g)
+            if loss_fn is not None:
+                loss = loss_fn(scores, y, g, group_weights)
+            else:
+                loss = group_softmax_loss(scores, y, g)
 
             opt.zero_grad()
             loss.backward()
