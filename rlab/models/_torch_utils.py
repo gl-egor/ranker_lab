@@ -172,6 +172,76 @@ def ips_group_softmax_loss(
     return (losses_t * weights).mean()
 
 
+def _compute_tail_head_masks(
+    item_pop_logits: dict[int, float],
+    tail_quantile: float = 0.25,
+    head_quantile: float = 0.75,
+) -> tuple[dict[int, bool], dict[int, bool]]:
+    """Tail/head masks по квантилям популярности (count позитивов в train)."""
+    if not item_pop_logits:
+        return {}, {}
+
+    counts = np.array(
+        [np.expm1(v) for v in item_pop_logits.values()],
+        dtype=np.float64,
+    )
+    tail_thr = float(np.quantile(counts, tail_quantile))
+    head_thr = float(np.quantile(counts, head_quantile))
+
+    is_tail: dict[int, bool] = {}
+    is_head: dict[int, bool] = {}
+    for item_id, logit in item_pop_logits.items():
+        count = float(np.expm1(logit))
+        is_tail[int(item_id)] = count <= tail_thr
+        is_head[int(item_id)] = count >= head_thr
+    return is_tail, is_head
+
+
+def tail_aware_listwise_loss(
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+    groups: torch.Tensor,
+    item_idx: torch.Tensor,
+    is_tail: dict[int, bool],
+    is_head: dict[int, bool],
+    tail_boost: float = 2.0,
+    head_discount: float = 0.5,
+    max_weight: float = 10.0,
+) -> torch.Tensor:
+    """Listwise loss с повышенным весом групп, где позитив — tail-айтем.
+
+    Группы с позитивом из нижнего квартиля популярности получают ``tail_boost``,
+    из верхнего — ``head_discount``, остальные — 1.0.
+    Веса нормализуются к среднему=1 и клиппируются ``max_weight``.
+    """
+    unique = torch.unique(groups)
+    losses: list[torch.Tensor] = []
+    raw_weights: list[float] = []
+
+    for gid in unique:
+        mask = groups == gid
+        log_prob = F.log_softmax(scores[mask], dim=0)
+        losses.append(-(log_prob * labels[mask]).sum())
+
+        pos_mask = labels[mask] > 0
+        if pos_mask.any():
+            pos_item = int(item_idx[mask][pos_mask][0].item())
+            if is_tail.get(pos_item, True):
+                w = tail_boost
+            elif is_head.get(pos_item, False):
+                w = head_discount
+            else:
+                w = 1.0
+        else:
+            w = 1.0
+        raw_weights.append(w)
+
+    losses_t = torch.stack(losses)
+    weights = torch.tensor(raw_weights, device=scores.device, dtype=scores.dtype)
+    weights = torch.clamp(weights / weights.mean(), max=max_weight)
+    return (losses_t * weights).mean()
+
+
 def _compute_item_popularity_logits(train_df: pd.DataFrame) -> dict[int, float]:
     """
     Лог-популярность айтемов по позитивам train rank_table:
@@ -598,6 +668,12 @@ def train_neural_ranker(
     pop_refresh_each_epoch = params.get("pop_resample_each_epoch", False)
     pop_reg_alpha = float(params.get("pop_reg_alpha", 0.0))
     ips_beta = float(params.get("ips_beta", 0.0))
+    tail_loss_boost = float(params.get("tail_loss_boost", 0.0))
+    tail_loss_head_discount = float(params.get("tail_loss_head_discount", 0.5))
+    tail_threshold_quantile = float(params.get("tail_threshold_quantile", 0.25))
+    head_threshold_quantile = float(params.get("head_threshold_quantile", 0.75))
+    tail_loss_max_weight = float(params.get("tail_loss_max_weight", 10.0))
+    use_tail_loss = tail_loss_boost > 0.0
 
     if (use_hard_mining or use_pop_weighted_sampler) and make_row_fn is None:
         raise ValueError(
@@ -612,6 +688,21 @@ def train_neural_ranker(
     # n_items для compute_item_scores
     n_items = feature_spec.cardinalities.get("item_idx", train_df["item_idx"].max() + 1)
     item_pop_logits = _compute_item_popularity_logits(train_df)
+    tail_mask: dict[int, bool] = {}
+    head_mask: dict[int, bool] = {}
+    if use_tail_loss:
+        tail_mask, head_mask = _compute_tail_head_masks(
+            item_pop_logits,
+            tail_quantile=tail_threshold_quantile,
+            head_quantile=head_threshold_quantile,
+        )
+        n_tail = sum(tail_mask.values())
+        n_head = sum(head_mask.values())
+        print(
+            f"  [tail loss] boost={tail_loss_boost}, head_discount={tail_loss_head_discount}, "
+            f"tail_q={tail_threshold_quantile}, head_q={head_threshold_quantile} "
+            f"(items: tail={n_tail}, head={n_head})"
+        )
 
     # ── Создаём DataLoaders ─────────────────────────────────────────────
     def _make_loader(df: pd.DataFrame, shuffle: bool, loader_seed: int) -> DataLoader:
@@ -733,7 +824,16 @@ def train_neural_ranker(
             y, g    = y.to(device), g.to(device)
 
             scores = forward_fn(model, u, i, n)
-            if ips_beta > 0.0:
+            if use_tail_loss:
+                base_loss = tail_aware_listwise_loss(
+                    scores, y, g, i,
+                    is_tail=tail_mask,
+                    is_head=head_mask,
+                    tail_boost=tail_loss_boost,
+                    head_discount=tail_loss_head_discount,
+                    max_weight=tail_loss_max_weight,
+                )
+            elif ips_beta > 0.0:
                 base_loss = ips_group_softmax_loss(
                     scores, y, g, i, item_pop_logits, beta=ips_beta,
                 )
