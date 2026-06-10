@@ -29,6 +29,7 @@ import rlab.models.deepfm_ranker    # noqa: F401
 import rlab.models.dcnv2_enhanced_ranker # noqa: F401
 import rlab.models.dcnv2_reg           # noqa: F401
 import rlab.models.deepfm_enhanced_ranker # noqa: F401
+import rlab.models.finalmlp_ranker        # noqa: F401
 
 
 def set_global_seed(seed: int) -> None:
