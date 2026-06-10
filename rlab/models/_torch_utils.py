@@ -99,14 +99,23 @@ class GroupBatchSampler(torch.utils.data.Sampler):
 
 
 def group_softmax_loss(
-    scores: torch.Tensor, labels: torch.Tensor, groups: torch.Tensor,
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+    groups: torch.Tensor,
+    *,
+    temperature: float = 1.0,
 ) -> torch.Tensor:
-    """Listwise: -log P(positive) под log-softmax по группе, среднее по группам."""
+    """Listwise: -log P(positive) под log-softmax по группе, среднее по группам.
+
+    temperature < 1 делает softmax «острее» — модель сильнее штрафует
+    за неверный порядок внутри группы. При temperature=1 — стандартный loss.
+    """
+    t = max(float(temperature), 1e-8)
     unique = torch.unique(groups)
     losses = []
     for gid in unique:
         mask = groups == gid
-        log_prob = F.log_softmax(scores[mask], dim=0)
+        log_prob = F.log_softmax(scores[mask] / t, dim=0)
         losses.append(-(log_prob * labels[mask]).sum())
     return torch.stack(losses).mean()
 
@@ -483,6 +492,10 @@ def train_neural_ranker(
     if forward_fn is None:
         forward_fn = lambda m, u, i, n: m(u, i, n)
 
+    loss_temperature = float(
+        params.get("loss_temperature", params.get("temperature", 1.0))
+    )
+
     t0 = time.time()
     for epoch in trange(1, params["max_epochs"] + 1, desc="epoch", unit="ep"):
 
@@ -532,7 +545,9 @@ def train_neural_ranker(
             if loss_fn is not None:
                 loss = loss_fn(scores, y, g, group_weights)
             else:
-                loss = group_softmax_loss(scores, y, g)
+                loss = group_softmax_loss(
+                    scores, y, g, temperature=loss_temperature,
+                )
 
             opt.zero_grad()
             loss.backward()

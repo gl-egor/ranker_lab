@@ -12,6 +12,10 @@ DCN-v2 Reg — enhanced-кодирования + tail-aware listwise loss.
    Head-группы получают вес ~1.0, tail — до 1 + alpha.
    При alpha=0 loss совпадает с обычным group_softmax_loss.
 
+3. Temperature в softmax loss (loss_temperature):
+       log_softmax(scores / tau). tau < 1 → более «острый» loss.
+       Рекомендуемый sweep: [0.5, 0.7, 1.0].
+
 Запуск на books5, train_size=60k, ids_only:
 
     from rlab.configs import DataConfig, EvalConfig, ExperimentConfig, ModelConfig
@@ -36,6 +40,7 @@ DCN-v2 Reg — enhanced-кодирования + tail-aware listwise loss.
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any
 
 import numpy as np
@@ -58,19 +63,23 @@ def group_softmax_loss_tail_aware(
     labels: torch.Tensor,
     groups: torch.Tensor,
     group_weights: torch.Tensor | None,
+    *,
+    temperature: float = 1.0,
 ) -> torch.Tensor:
     """
     Listwise loss с мягким бонусом для tail-групп.
 
     group_weights: (max_group_id + 1,) — вес на группу.
     weight = 1 + alpha * (1 - normalized_popularity) позитивного айтема.
-    При alpha=0 все веса = 1 → эквивалент group_softmax_loss.
+    temperature: делитель для scores перед softmax (tau < 1 → острее).
+    При alpha=0 все веса = 1 → эквивалент group_softmax_loss с temperature.
     """
+    t = max(float(temperature), 1e-8)
     unique = torch.unique(groups)
     losses = []
     for gid in unique:
         mask = groups == gid
-        log_prob = F.log_softmax(scores[mask], dim=0)
+        log_prob = F.log_softmax(scores[mask] / t, dim=0)
         loss_g = -(log_prob * labels[mask]).sum()
         if group_weights is not None:
             w = group_weights[gid.long()]
@@ -139,6 +148,7 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "multihash_num_hashes":  3,
     # tail-aware loss
     "tail_aware_alpha":  0.3,
+    "loss_temperature":  1.0,
     # оптимизация
     "lr":                1e-3,
     "emb_lr_mult":       1.0,
@@ -179,6 +189,9 @@ class DCNv2RegRanker(Ranker):
     ) -> dict[str, Any]:
         p = {**DEFAULT_PARAMS, **params}
         alpha = float(p.get("tail_aware_alpha", 0))
+        loss_temperature = float(
+            p.get("loss_temperature", p.get("temperature", 1.0))
+        )
 
         num_cols = feature_spec.numerical_cols
         if num_cols:
@@ -211,7 +224,10 @@ class DCNv2RegRanker(Ranker):
             group_weights = compute_tail_aware_group_weights(
                 train_df, feature_spec, alpha,
             ).to(self._device)
-            loss_fn = group_softmax_loss_tail_aware
+            loss_fn = partial(
+                group_softmax_loss_tail_aware,
+                temperature=loss_temperature,
+            )
 
         meta = train_neural_ranker(
             model=self._model,
@@ -227,6 +243,7 @@ class DCNv2RegRanker(Ranker):
             group_weights=group_weights,
         )
         meta["tail_aware_alpha"] = alpha
+        meta["loss_temperature"] = loss_temperature
         if group_weights is not None:
             meta["group_weight_min"] = float(group_weights.min().cpu())
             meta["group_weight_max"] = float(group_weights.max().cpu())
