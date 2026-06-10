@@ -31,6 +31,8 @@ class DataConfig:
     test_size    : аналогично.
     feature_set  : имя набора фичей из feature_groups (см. FeatureConfig).
                    Для H3 sweep'им между 'full' и 'no_cross'.
+                   'no_hcf' — ids + user_mean_rating, item_popularity,
+                   item_mean_rating (честное сравнение с CatBoost).
     n_neg_train  : кол-во негативов на позитив в train.
     n_neg_eval   : то же для valid/test (обычно больше, например 50-100).
     neg_strategy : 'random' | 'popularity' | 'hard'. Hard требует тёплого старта.

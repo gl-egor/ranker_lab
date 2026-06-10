@@ -27,6 +27,9 @@ FEATURE_GROUPS: dict[str, list[str]] = {
     "ids":        ["user_idx", "item_idx"],
     "user_stats": ["history_len", "user_mean_rating", "user_interaction_count"],
     "item_stats": ["item_popularity", "item_popularity_log", "item_mean_rating"],
+    # Базовые статистики, которые CatBoost использует вместе с ids
+    # (без history_len, popularity_log и cross-фичей).
+    "catboost_stats": ["user_mean_rating", "item_popularity", "item_mean_rating"],
     "cross":      ["user_item_prev_count", "user_item_seen_before"],  # ← H3
 }
 
@@ -36,7 +39,9 @@ FEATURE_SETS: dict[str, list[str]] = {
     "full":            ["ids", "user_stats", "item_stats", "cross"],
     "no_cross":        ["ids", "user_stats", "item_stats"],
     "no_cross_no_ids": ["user_stats", "item_stats"],
-    "ids_only":        ["ids"],                # для sanity-check нейронок
+    "ids_only":        ["ids"],                # только эмбеддинги, без статистик
+    # ids + базовые статистики CatBoost — честное сравнение с ids_only
+    "no_hcf":          ["ids", "catboost_stats"],
 }
 
 
