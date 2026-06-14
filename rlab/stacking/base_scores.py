@@ -114,11 +114,33 @@ def generate_full_train_scores(
     }
 
 
-def stacking_cache_path(cfg: ExperimentConfig, model_kind: str) -> Path:
-    cache_dir = Path(cfg.output_dir) / "stacking" / cfg.data.dataset
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    key = f"{cfg.hash()}__{model_kind}__oof{cfg.stacking.n_oof_folds}.parquet"
-    return cache_dir / key
+def stacking_cache_dir(cfg: ExperimentConfig, model_kind: str) -> Path:
+    """Директория кеша: отдельные parquet для train / valid / test."""
+    cache_root = Path(cfg.output_dir) / "stacking" / cfg.data.dataset
+    key = f"{cfg.hash()}__{model_kind}__oof{cfg.stacking.n_oof_folds}"
+    path = cache_root / key
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _load_cached_scores(cache_dir: Path) -> dict[str, np.ndarray] | None:
+    paths = {
+        split: cache_dir / f"{split}.parquet"
+        for split in ("train", "valid", "test")
+    }
+    if not all(p.exists() for p in paths.values()):
+        return None
+    return {
+        split: pd.read_parquet(p)["score"].values.astype(np.float32)
+        for split, p in paths.items()
+    }
+
+
+def _save_cached_scores(cache_dir: Path, scores: dict[str, np.ndarray]) -> None:
+    for split, arr in scores.items():
+        pd.DataFrame({"score": arr}).to_parquet(
+            cache_dir / f"{split}.parquet", index=False,
+        )
 
 
 def load_or_generate_base_scores(
@@ -135,14 +157,12 @@ def load_or_generate_base_scores(
     Возвращает dict с ключами 'train', 'valid', 'test' — numpy-массивы скоров.
     Кеширует в results/stacking/{dataset}/.
     """
-    cache_path = stacking_cache_path(cfg, model_kind)
-    if cache_path.exists() and not force_recompute:
-        cached = pd.read_parquet(cache_path)
-        return {
-            "train": cached["train_score"].values.astype(np.float32),
-            "valid": cached["valid_score"].values.astype(np.float32),
-            "test": cached["test_score"].values.astype(np.float32),
-        }
+    cache_dir = stacking_cache_dir(cfg, model_kind)
+    if not force_recompute:
+        cached = _load_cached_scores(cache_dir)
+        if cached is not None:
+            print(f"  [base_scores] cache HIT: {model_kind}")
+            return cached
 
     params = cfg.stacking.base_model_params.get(model_kind, cfg.model.params)
     n_folds = cfg.stacking.n_oof_folds
@@ -170,13 +190,13 @@ def load_or_generate_base_scores(
     valid_scores = split_scores["valid"]
     test_scores = split_scores["test"]
 
-    cache_df = pd.DataFrame({
-        "train_score": train_scores,
-        "valid_score": valid_scores,
-        "test_score": test_scores,
-    })
-    cache_df.to_parquet(cache_path, index=False)
-    return {"train": train_scores, "valid": valid_scores, "test": test_scores}
+    scores = {
+        "train": train_scores,
+        "valid": valid_scores,
+        "test": test_scores,
+    }
+    _save_cached_scores(cache_dir, scores)
+    return scores
 
 
 def build_score_matrix(

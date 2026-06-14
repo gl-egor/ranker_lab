@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from rlab.models.base import FeatureSpec
+from rlab.stacking.base_scores import _load_cached_scores, _save_cached_scores
 from rlab.stacking.calibration import MultiModelCalibrator
 from rlab.stacking.gating_ranker import (
     extract_context_matrix,
@@ -113,3 +114,19 @@ def test_segment_analysis():
     )
     assert "popularity" in segments
     assert "history_len" in segments
+
+
+def test_base_scores_cache_different_lengths(tmp_path):
+    """train/valid/test имеют разную длину — кеш не должен падать."""
+    scores = {
+        "train": np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32),
+        "valid": np.array([0.5, 0.6], dtype=np.float32),
+        "test": np.array([0.1], dtype=np.float32),
+    }
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    _save_cached_scores(cache_dir, scores)
+    loaded = _load_cached_scores(cache_dir)
+    assert loaded is not None
+    for split in scores:
+        np.testing.assert_array_equal(loaded[split], scores[split])
