@@ -90,6 +90,49 @@ class EvalConfig:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# StackingConfig — contextual adaptive stacking meta-ranker
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class StackingConfig:
+    """
+    base_models       : список kind базовых ранкеров для ensemble.
+    base_model_params : гиперпараметры по kind (если пусто — cfg.model.params).
+    n_oof_folds       : K для OOF-скоров на train.
+    calibrate         : Platt scaling перед gating network.
+    context_features  : контекстные фичи для gating (user/item stats).
+    gate_hidden       : размер скрытого слоя gating MLP.
+    gate_layers       : число скрытых слоёв.
+    gate_lr           : learning rate gating network.
+    gate_epochs       : max эпох обучения gating.
+    gate_patience     : early stopping patience.
+    gate_dropout      : dropout в gating MLP.
+    groups_per_batch  : групп на батч при обучении gating.
+    force_recompute   : пересчитать base scores даже если есть кеш.
+    """
+    base_models: list[str] = field(
+        default_factory=lambda: ["catboost", "dcnv2_enhanced", "finalmlp"]
+    )
+    base_model_params: dict[str, dict[str, Any]] = field(default_factory=dict)
+    n_oof_folds: int = 5
+    calibrate: bool = True
+    context_features: list[str] = field(default_factory=lambda: [
+        "history_len",
+        "item_popularity_log",
+        "user_interaction_count",
+        "item_mean_rating",
+        "user_mean_rating",
+    ])
+    gate_hidden: int = 32
+    gate_layers: int = 2
+    gate_lr: float = 1e-3
+    gate_epochs: int = 50
+    gate_patience: int = 10
+    gate_dropout: float = 0.1
+    groups_per_batch: int = 256
+    force_recompute: bool = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ExperimentConfig — корень
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
@@ -113,6 +156,7 @@ class ExperimentConfig:
     output_dir: str = "./results"
     cache_dir: str = "./cache"
     device: str = "cuda"
+    stacking: StackingConfig = field(default_factory=StackingConfig)
 
     # ─── сериализация ────────────────────────────────────────────────────────
     def to_dict(self) -> dict:

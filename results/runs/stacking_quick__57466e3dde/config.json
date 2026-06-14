@@ -1,0 +1,76 @@
+{
+  "name": "stacking_quick",
+  "data": {
+    "dataset": "books5",
+    "train_size": 3000,
+    "valid_size": 5000,
+    "test_size": 5000,
+    "feature_set": "full",
+    "n_neg_train": 5,
+    "n_neg_eval": 50,
+    "neg_strategy": "random",
+    "max_users": 2000
+  },
+  "model": {
+    "kind": "adaptive_stacking",
+    "params": {}
+  },
+  "eval": {
+    "k": 10,
+    "stratify_by_pop": true,
+    "n_pop_bins": 4,
+    "bootstrap_n": 0,
+    "bootstrap_alpha": 0.05,
+    "eval_warm_only": false
+  },
+  "seed": 42,
+  "output_dir": "./results",
+  "cache_dir": "./cache",
+  "device": "cuda",
+  "stacking": {
+    "base_models": [
+      "catboost",
+      "dcnv2_enhanced",
+      "finalmlp"
+    ],
+    "base_model_params": {
+      "catboost": {
+        "iterations": 100
+      },
+      "dcnv2_enhanced": {
+        "max_epochs": 5,
+        "patience": 3,
+        "groups_per_batch": 256,
+        "lr": 0.001,
+        "hard_mining": false,
+        "iterations": 100
+      },
+      "finalmlp": {
+        "max_epochs": 5,
+        "patience": 3,
+        "groups_per_batch": 256,
+        "lr": 0.001,
+        "tail_aware_alpha": 0.3,
+        "loss_temperature": 0.7,
+        "iterations": 100
+      }
+    },
+    "n_oof_folds": 3,
+    "calibrate": true,
+    "context_features": [
+      "history_len",
+      "item_popularity_log",
+      "user_interaction_count",
+      "item_mean_rating",
+      "user_mean_rating"
+    ],
+    "gate_hidden": 32,
+    "gate_layers": 2,
+    "gate_lr": 0.001,
+    "gate_epochs": 20,
+    "gate_patience": 10,
+    "gate_dropout": 0.1,
+    "groups_per_batch": 256,
+    "force_recompute": false
+  }
+}
