@@ -7,7 +7,11 @@ import pandas as pd
 import pytest
 
 from rlab.models.base import FeatureSpec
-from rlab.stacking.base_scores import _load_cached_scores, _save_cached_scores
+from rlab.stacking.base_scores import (
+    _load_cached_scores,
+    _save_cached_scores,
+    check_stacking_cache_fix,
+)
 from rlab.stacking.calibration import MultiModelCalibrator
 from rlab.stacking.gating_ranker import (
     extract_context_matrix,
@@ -118,6 +122,7 @@ def test_segment_analysis():
 
 def test_base_scores_cache_different_lengths(tmp_path):
     """train/valid/test имеют разную длину — кеш не должен падать."""
+    assert check_stacking_cache_fix()
     scores = {
         "train": np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32),
         "valid": np.array([0.5, 0.6], dtype=np.float32),
@@ -126,7 +131,10 @@ def test_base_scores_cache_different_lengths(tmp_path):
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
     _save_cached_scores(cache_dir, scores)
-    loaded = _load_cached_scores(cache_dir)
+    loaded = _load_cached_scores(
+        cache_dir,
+        expected_lengths={"train": 4, "valid": 2, "test": 1},
+    )
     assert loaded is not None
     for split in scores:
         np.testing.assert_array_equal(loaded[split], scores[split])
